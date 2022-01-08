@@ -7,9 +7,10 @@ build:
 
   image:
     name: $CI_REGISTRY/doragasu/esp-dockerfiles/esp8266_rtos_sdk:release_v3.4
+    entrypoint: [""]
 
   script:
-    - export PATH=$PATH:$HOME/dev/xtensa-lx106-elf/bin && make -j$(nproc)
+    - make -j$(nproc)
     - cd build && tar -cJf ../mw_fw_rtos-$CI_COMMIT_REF_SLUG.tar.xz {bootloader/bootloader.bin,mw-fw-rtos.bin,ota_data_initial.bin,partitions.bin}
 
   artifacts:
