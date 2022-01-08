@@ -1,0 +1,27 @@
+stages:
+  - build
+  - upload
+
+build:
+  stage: build
+
+  image:
+    name: $CI_REGISTRY/doragasu/esp-dockerfiles/esp8266_rtos_sdk:release_v3.4
+
+  script:
+    - export PATH=$PATH:$HOME/dev/xtensa-lx106-elf/bin && make -j$(nproc)
+    - cd build && tar -cJf ../mw_fw_rtos-$CI_COMMIT_REF_SLUG.tar.xz {bootloader/bootloader.bin,mw-fw-rtos.bin,ota_data_initial.bin,partitions.bin}
+
+  artifacts:
+    paths:
+      - mw_fw_rtos-$CI_COMMIT_REF_SLUG.tar.xz
+
+upload:
+  stage: upload
+  only:
+    - tags
+
+  image: curlimages/curl:latest
+
+  script:
+    - 'curl --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file mw_fw_rtos-$CI_COMMIT_REF_SLUG.tar.xz "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/mw_firmware-$CI_COMMIT_TAG/$CI_COMMIT_TAG/mw_fw_rtos-$CI_COMMIT_TAG.tar.xz"'
