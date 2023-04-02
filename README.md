@@ -2,6 +2,9 @@
 
 Firmare for the ESP8266 WiFi module installed in MegaWiFi cartridges. This firmware talks directly to the MegaWiFi API (mw-api) running on the Genesis/MegaDrive console, allowing it to connect to WiFi access points, and to send and receive data through The Internet using standard TCP and UDP protocols. There are some additional goodies provided by the firmware, like flash read/write functions and SNTP time synchronization.
 
+# Obtaining pre-built firmware files
+Pre-built firmware archives can be found in [the package registry](https://gitlab.com/doragasu/mw-fw-rtos/-/packages). You can use a [MegaWiFi programmer](https://gitlab.com/doragasu/mw-prog) and the [MegaDrive Memory Administration client](https://gitlab.com/doragasu/mw-mdma-cli) to burn this files to the ESP8266 in a MegaWiFi cartridge. Go to the [Flashing section](#flashing) for more details. Typically you will only need to burn the latest version of the firmware once, because from that point, firmware updates can be installed Over-The-Air.
+
 # Building
 
 This firmware is based on [ESP8266\_RTOS\_SDK](https://github.com/espressif/ESP8266_RTOS_SDK). Follow the SDK instructions to install the toolchain and build the firmware. Currently this project builds against `release/v3.4` branch, so make sure to check it out. If you have Docker installed, the easiest way to build the firmware is using my `esp-dockerfiles` images. From the project diretory run:
