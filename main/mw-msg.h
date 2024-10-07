@@ -10,6 +10,7 @@
 #ifndef _MW_MSG_H_
 #define _MW_MSG_H_
 
+#include "esp_netif_ip_addr.h"
 #include <esp_wifi.h>
 
 /// Maximum SSID length (including '\0').
@@ -35,11 +36,11 @@
 /** \addtogroup MwApi MwEvent Events parsed by the system FSM.
  *  \{ */
 typedef enum {
-	MW_EV_NONE = 0,		///< No event.
-	MW_EV_INIT_DONE,	///< Initialization complete.
-	MW_EV_WIFI,		///< WiFi events.
-	MW_EV_SER_RX,		///< Data reception from serial line.
-	MW_EV_MAX		///< Number of total events.
+	MW_EV_NONE = 0,  ///< No event.
+	MW_EV_INIT_DONE, ///< Initialization complete.
+	MW_EV_NET,       ///< Network events.
+	MW_EV_SER_RX,    ///< Data reception from serial line.
+	MW_EV_MAX        ///< Number of total events.
 } MwEvent;
 /** \} */
 
@@ -51,13 +52,13 @@ typedef enum {
 /** \addtogroup MwApi MwState Possible states of the system state machine.
  *  \{ */
 typedef enum {
-	MW_ST_INIT = 0,		///< Initialization state.
-	MW_ST_IDLE,			///< Idle state, until connected to an AP.
-	MW_ST_AP_JOIN,		///< Trying to join an access point.
-	MW_ST_RESERVED,
-	MW_ST_READY,		///< Connected to The Internet.
-	MW_ST_TRANSPARENT,	///< Transparent communication state.
-	MW_ST_MAX			///< Limit number for state machine.
+	MW_ST_INIT = 0,    ///< Initialization state.
+	MW_ST_IDLE,        ///< Idle state, until connected to an AP.
+	MW_ST_AP_JOIN,     ///< Trying to join an access point.
+	MW_ST_RESERVED,    ///< Reserved
+	MW_ST_READY,       ///< Connected to The Internet.
+	MW_ST_TRANSPARENT, ///< Transparent communication state.
+	MW_ST_MAX          ///< Limit number for state machine.
 } MwState;
 /** \} */
 
@@ -81,9 +82,9 @@ typedef struct {
 typedef struct {
 	uint8_t cfgNum;
 	uint8_t reserved[3];
-	tcpip_adapter_ip_info_t cfg;
-	ip_addr_t dns1;
-	ip_addr_t dns2;
+	esp_netif_ip_info_t cfg;
+	esp_ip4_addr_t dns1;
+	esp_ip4_addr_t dns2;
 } MwMsgIpCfg;
 
 /// Date and time message
@@ -128,26 +129,32 @@ struct mw_gamertag {
 
 /// Gamertag set message data
 struct mw_gamertag_set_msg {
-	uint8_t slot;			///< Slot to store gamertag (0 to 2)
-	uint8_t reserved[3];		///< Reserved, set to 0
-	struct mw_gamertag gamertag;	///< Gamertag to set
+	uint8_t slot;                ///< Slot to store gamertag (0 to 2)
+	uint8_t reserved[3];         ///< Reserved, set to 0
+	struct mw_gamertag gamertag; ///< Gamertag to set
 };
 
 /// Advanced WiFi configuration. Handle with care!
 struct mw_wifi_adv_cfg {
-	uint8_t qos_enable;			///< WiFi QOS feature enable flag
-	uint8_t ampdu_rx_enable;		///< WiFi AMPDU RX feature enable flag
-	uint8_t rx_ba_win;			///< WiFi Block Ack RX window size
-	uint8_t rx_ampdu_buf_num;		///< WiFi AMPDU RX buffer number
-	uint32_t rx_ampdu_buf_len;		///< WiFi AMPDU RX buffer length
-	uint32_t rx_max_single_pkt_len;		///< WiFi RX max single packet size
-	uint32_t rx_buf_len;			///< WiFi RX buffer size
-	uint8_t amsdu_rx_enable;		///< WiFi AMSDU RX feature enable flag
-	uint8_t rx_buf_num;			///< WiFi RX buffer number
-	uint8_t rx_pkt_num;			///< WiFi RX packet number
-	uint8_t left_continuous_rx_buf_num;	///< WiFi Rx left continuous rx buffer number
-	uint8_t tx_buf_num;			///< WiFi TX buffer number
-	uint8_t reserved[3];			///< Unused, set to 0
+//	uint8_t qos_enable;                 ///< WiFi QOS feature enable flag
+	uint8_t ampdu_rx_enable;            ///< WiFi AMPDU RX feature enable flag
+	uint8_t ampdu_tx_enable;            ///< WiFi AMPDU TX feature enable flag (new)
+	uint8_t amsdu_tx_enable;            ///< WiFi AMSDU TX feature enable flag (new)
+	uint8_t static_rx_buf_num;          ///< WiFi static RX buffer number (new)
+	uint8_t dynamic_rx_buf_num;         ///< WiFi dynamic RX buffer number (new)
+	uint8_t static_tx_buf_num;          ///< WiFi static TX buffer number (new)
+	uint8_t dynamic_tx_buf_num;         ///< WiFi dynamic TX buffer number (new)
+	uint8_t rx_ba_win;                  ///< WiFi Block Ack RX window size
+//	uint8_t rx_ampdu_buf_num;           ///< WiFi AMPDU RX buffer number
+//	uint32_t rx_ampdu_buf_len;          ///< WiFi AMPDU RX buffer length
+//	uint32_t rx_max_single_pkt_len;     ///< WiFi RX max single packet size
+//	uint32_t rx_buf_len;                ///< WiFi RX buffer size
+//	uint8_t amsdu_rx_enable;            ///< WiFi AMSDU RX feature enable flag
+//	uint8_t rx_buf_num;                 ///< WiFi RX buffer number
+//	uint8_t rx_pkt_num;                 ///< WiFi RX packet number
+//	uint8_t left_continuous_rx_buf_num; ///< WiFi Rx left continuous rx buffer number
+//	uint8_t tx_buf_num;                 ///< WiFi TX buffer number
+//	uint8_t reserved[3];                ///< Unused, set to 0
 };
 
 /// Flash chip identifiers
@@ -158,19 +165,19 @@ struct mw_flash_id {
 
 /// Game API request
 struct mw_ga_request {
-	uint8_t method;		///< Request method
-	uint8_t num_paths;	///< Number of paths
-	uint8_t num_kv_pairs;	///< Number of key/value pairs
-	char req[];		///< Request data
+	uint8_t method;       ///< Request method
+	uint8_t num_paths;    ///< Number of paths
+	uint8_t num_kv_pairs; ///< Number of key/value pairs
+	char req[];           ///< Request data
 };
 
 /** \addtogroup MwApi MwSockStat Socket status.
  *  \{ */
 typedef enum {
-	MW_SOCK_NONE = 0,	///< Unused socket.
-	MW_SOCK_TCP_LISTEN,	///< Socket bound and listening.
-	MW_SOCK_TCP_EST,	///< TCP socket, connection established.
-	MW_SOCK_UDP_READY	///< UDP socket ready for sending/receiving
+	MW_SOCK_NONE = 0,   ///< Unused socket.
+	MW_SOCK_TCP_LISTEN, ///< Socket bound and listening.
+	MW_SOCK_TCP_EST,    ///< TCP socket, connection established.
+	MW_SOCK_UDP_READY   ///< UDP socket ready for sending/receiving
 } MwSockStat;
 /** \} */
 
@@ -180,21 +187,21 @@ typedef union {
 	uint32_t st_flags;
 	struct {
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-		MwState sys_stat:8;	///< System status
-		uint8_t online:1;	///< Module is connected to the Internet
-		uint8_t cfg_ok:1;	///< Configuration OK
-		uint8_t dt_ok:1;	///< Date and time synchronized at least once
-		uint8_t cfg:2;		///< Default network configuration
-		uint16_t reserved:3;	///< Reserved flags
-		uint16_t ch_ev:16;	///< Channel flags with the pending event
+		MwState sys_stat:8;  ///< System status
+		uint8_t online:1;    ///< Module is connected to the Internet
+		uint8_t cfg_ok:1;    ///< Configuration OK
+		uint8_t dt_ok:1;     ///< Date and time synchronized at least once
+		uint8_t cfg:2;       ///< Default network configuration
+		uint16_t reserved:3; ///< Reserved flags
+		uint16_t ch_ev:16;   ///< Channel flags with the pending event
 #else
-		uint16_t ch_ev:16;	///< Channel flags with the pending event
-		uint16_t reserved:3;	///< Reserved flags
-		uint8_t cfg:2;		///< Default network configuration
-		uint8_t dt_ok:1;	///< Date and time synchronized at least once
-		uint8_t cfg_ok:1;	///< Configuration OK
-		uint8_t online:1;	///< Module is connected to the Internet
-		MwState sys_stat:8;	///< System status
+		uint16_t ch_ev:16;   ///< Channel flags with the pending event
+		uint16_t reserved:3; ///< Reserved flags
+		uint8_t cfg:2;       ///< Default network configuration
+		uint8_t dt_ok:1;     ///< Date and time synchronized at least once
+		uint8_t cfg_ok:1;    ///< Configuration OK
+		uint8_t online:1;    ///< Module is connected to the Internet
+		MwState sys_stat:8;  ///< System status
 #endif
 	};
 } MwMsgSysStat;

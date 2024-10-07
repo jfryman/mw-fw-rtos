@@ -336,7 +336,7 @@ void http_cert_flash_write(const char *data, uint16_t len)
 		// Write certificate hash
 		esp_partition_write(d.p, 0, &d.hash_tmp, sizeof(uint32_t));
 		d.s = MW_HTTP_ST_IDLE;
-		LOGI("certificate %08x stored", d.hash_tmp);
+		LOGI("certificate %08"PRIx32" stored", d.hash_tmp);
 		if (to_write < len) {
 			LOGW("ignoring %d certificate bytes", len - to_write);
 		}
@@ -349,7 +349,7 @@ uint32_t http_cert_query(void)
 	uint32_t cert = 0xFFFFFFFF;
 
 	esp_partition_read(d.p, 0, &cert, sizeof(uint32_t));
-	LOGD("cert hash: %08x", cert);
+	LOGD("cert hash: %08"PRIx32, cert);
 
 	return cert;
 }
@@ -376,12 +376,12 @@ bool http_cert_set(uint32_t x509_hash, uint16_t cert_len)
 		goto out;
 	}
 	if (x509_hash == installed) {
-		LOGW("cert %08x is already installed", x509_hash);
+		LOGW("cert %08"PRIx32" is already installed", x509_hash);
 		err = false;
 		goto out;
 	}
 	if (cert_len > MW_CERT_MAXLEN) {
-		LOGE("cert is %d bytes, maximum allowed is "
+		LOGE("cert is %"PRIu16" bytes, maximum allowed is "
 				STR(MW_CERT_MAXLEN) " bytes",
 				cert_len);
 		goto out;
@@ -392,7 +392,7 @@ bool http_cert_set(uint32_t x509_hash, uint16_t cert_len)
 	if (!err) {
 		// Write certificate length, and store for later the hash
 		uint32_t dw_len = cert_len;
-		LOGD("write cert hash %08x, len %" PRIu32, x509_hash, dw_len);
+		LOGD("write cert hash %08"PRIx32", len %" PRIu32, x509_hash, dw_len);
 		err = esp_partition_write(d.p, CERT_LEN_OFF, &dw_len,
 				sizeof(uint32_t));
 		d.hash_tmp = x509_hash;

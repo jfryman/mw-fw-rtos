@@ -1,7 +1,9 @@
 build
 firmware
 *.vim
-.ycm_extra_conf.pyc
+.ycm_extra_conf.py
 .*.swp
 ones*k.bin
 *.old
+sdkconfig
+.cache

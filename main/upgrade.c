@@ -49,7 +49,6 @@ esp_err_t upgrade_firmware(const char *server, const char *name)
 {
 	char url[URL_MAX_LEN + 1] = "http://";
 	int pos = 7;
-	esp_http_client_config_t cfg = {};
 	esp_err_t err;
 
 	// Build URL. E.g.: "https://doragasu.com/mw_update/mw_rtos_std_v1.4.0"
@@ -58,11 +57,17 @@ esp_err_t upgrade_firmware(const char *server, const char *name)
 	pos = append(url, pos, name);
 
 	LOGI("upgrading from %s", url);
-	cfg.url = url;
-//	cfg.cert_pem = cert;
-	cfg.cert_pem = NULL;
+	const esp_http_client_config_t http_cfg = {
+		.url = url,
+		.cert_pem = NULL, // Not secure!
+		.keep_alive_enable = true
+	};
 
-	err = esp_https_ota(&cfg);
+		const esp_https_ota_config_t ota_cfg = {
+		.http_config = &http_cfg,
+	};
+
+	err = esp_https_ota(&ota_cfg);
 
 	if (err) {
 		LOGE("upgrade failed with code %d", err);

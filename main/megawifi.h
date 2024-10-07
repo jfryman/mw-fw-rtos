@@ -16,8 +16,9 @@
 #define MW_FW_VERSION_MINOR	5
 /// Minor firmware version
 #define MW_FW_VERSION_MICRO	1
-/// Firmware variant, "std" for standard version
-#define MW_FW_VARIANT	"std"
+/// Firmware variant, "std" for standard ESP8266 version,
+/// ec3 for standard ESP32-C3 version
+#define MW_FW_VARIANT	"ec3"
 
 /// Maximum length of an NTP pool (TZ string + up to 3 servers)
 #define MW_NTP_POOL_MAXLEN	(64 + 80)

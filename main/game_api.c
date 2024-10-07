@@ -257,7 +257,7 @@ uint16_t ga_request(esp_http_client_method_t method, uint8_t num_paths,
 	http_method_set(method);
 	http_open(0);
 	http_finish(&status, body_len);
-	LOGD("finished with code=%d, length=%d", status, *body_len);
+	LOGD("finished with code=%"PRIu16", length=%"PRId32, status, *body_len);
 
 	free(url);
 

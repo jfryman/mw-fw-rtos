@@ -1,7 +1,7 @@
 /************************************************************************//**
  * \brief MeGaWiFi application programming interface.
  *
- * \Author Jesus Alonso (idoragasu)
+ * \Author Jesus Alonso (doragasu)
  * \date   2016
  ****************************************************************************/
 
@@ -23,7 +23,7 @@
 #include <lwip/netdb.h>
 #include <lwip/dns.h>
 #include <lwip/ip_addr.h>
-#include <lwip/apps/sntp.h>
+#include <lwip/ip4_addr.h>
 
 // TLS
 #ifdef CONFIG_SSL_USING_WOLFSSL
@@ -33,17 +33,20 @@
 #endif
 
 // Time keeping
-#include <sntp.h>
+#include <esp_sntp.h>
 #include <time.h>
 
 // WiFi
 #include <esp_system.h>
+#include <esp_event.h>
 #include <esp_wifi.h>
-#include <esp_event_loop.h>
 #include <esp_sleep.h>
+#include <esp_netif.h>
+#include <esp_mac.h>
 
 // Flash manipulation
 #include <esp_partition.h>
+#include <esp_flash.h>
 #include "flash.h"
 
 #include <esp_log.h>
@@ -58,7 +61,7 @@
 #include "game_api.h"
 #include "upgrade.h"
 
-#define MW_SERVER_DEFAULT		"doragasu.com"
+#define MW_SERVER_DEFAULT "doragasu.com"
 
 /// Maximum number of reassociation attempts
 #define MW_REASSOC_MAX		5
@@ -148,7 +151,7 @@ typedef struct {
 	/// Access point configuration (SSID, password).
 	ApCfg ap[MW_NUM_AP_CFGS];
 	/// IPv4 (IP addr, mask, gateway). If IP=0.0.0.0, use DHCP.
-	tcpip_adapter_ip_info_t ip[MW_NUM_AP_CFGS];
+	esp_netif_ip_info_t ip[MW_NUM_AP_CFGS];
 	/// DNS configuration (when not using DHCP). 2 servers per AP config.
 	ip_addr_t dns[MW_NUM_AP_CFGS][MW_NUM_DNS_SERVERS];
 	/// Pool length for SNTP configuration
@@ -249,7 +252,7 @@ static void close_all(void) {
 
 	for (i = 0; i < MW_MAX_SOCK; i++) {
 		if (d.ss[i] > 0) {
-			LOGI("Closing sock %d on ch %d", d.sock[i], i + 1);
+			LOGI("Closing sock %"PRId8" on ch %d", d.sock[i], i + 1);
 			MwSockClose(i + 1);
 			LsdChDisable(i + 1);
 		}
@@ -272,10 +275,7 @@ static void deep_sleep(void)
 {
 	LOGI("Entering deep sleep");
 	disconnect();
-	esp_deep_sleep(0);
-	// As it takes a little for the module to enter deep
-	// sleep, stay here for a while
-	vTaskDelayMs(60000);
+	esp_deep_sleep_start();
 }
 
 void sleep_timer_cb(TimerHandle_t xTimer)
@@ -285,23 +285,80 @@ void sleep_timer_cb(TimerHandle_t xTimer)
 	deep_sleep();
 }
 
-static esp_err_t event_handler(void *ctx, system_event_t *event)
-{
-	QueueHandle_t q = (QueueHandle_t)ctx;
-	MwFsmMsg msg;
+typedef struct nodata {
+} nodata_t;
 
-	if (!ctx || !event) {
-		LOGE("missing ctx or event");
-		return ESP_ERR_INVALID_ARG;
+// Table with network events and their corresponding data structures
+#define NET_EVENT_TABLE(X_MACRO) \
+	X_MACRO(WIFI_EVENT_STA_START, nodata_t) \
+	X_MACRO(SYSTEM_EVENT_STA_STOP, nodata_t) \
+	X_MACRO(IP_EVENT_STA_GOT_IP, ip_event_got_ip_t) \
+	X_MACRO(WIFI_EVENT_STA_CONNECTED, wifi_event_sta_connected_t) \
+	X_MACRO(WIFI_EVENT_STA_DISCONNECTED wifi_event_sta_disconnected_t)
+
+#define X_AS_EVT_DATA_DUP(event, data_struct) \
+	case event: 
+
+struct net_event {
+	esp_event_base_t event_base;
+	int32_t event_id;
+	union {
+		ip_event_got_ip_t got_ip;
+		wifi_event_sta_connected_t sta_connected;
+		wifi_event_sta_disconnected_t sta_disconnected;
+	};
+};
+
+#define NET_EVENT_BASE_LEN (sizeof(esp_event_base_t) + sizeof(int32_t))
+
+//static esp_err_t event_handler(void *ctx, system_event_t *event)
+static void event_handler(void* arg, esp_event_base_t event_base,
+                                int32_t event_id, void* event_data)
+{
+	QueueHandle_t q = (QueueHandle_t)arg;
+	MwFsmMsg msg;
+	uint8_t data_len;
+
+	if (!arg) {
+		LOGE("ctx");
+		return;
 	}
 
+	switch (event_id) {
+	case WIFI_EVENT_STA_START:
+	case WIFI_EVENT_STA_STOP:
+		data_len = 0;
+		break;
+
+	case IP_EVENT_STA_GOT_IP:
+		data_len = sizeof(ip_event_got_ip_t);
+		break;
+
+	case WIFI_EVENT_STA_CONNECTED:
+		data_len = sizeof(wifi_event_sta_connected_t);
+		break;
+
+	case WIFI_EVENT_STA_DISCONNECTED:
+		data_len = sizeof(wifi_event_sta_connected_t);
+		break;
+
+	default:
+		LOGE("unsupported event: %"PRId32, event_id);
+		return;
+	}
+
+	struct net_event *evt = malloc(NET_EVENT_BASE_LEN + data_len);
+	if (data_len) {
+		memcpy(&evt->got_ip, event_data, data_len);
+	}
+	evt->event_base = event_base;
+	evt->event_id = event_id;
+
 	// Forward event to sysfsm
-	msg.e = MW_EV_WIFI;
-	msg.d = malloc(sizeof(system_event_t));
-	memcpy(msg.d, event, sizeof(system_event_t));
+	msg.e = MW_EV_NET;
+	msg.d = evt;
 
 	xQueueSend(q, &msg, portMAX_DELAY);
-	return ESP_OK;
 }
 
 /// Prints a list of found scanned stations
@@ -309,14 +366,15 @@ static void ap_print(const wifi_ap_record_t *ap, int n_aps) {
 	wifi_auth_mode_t auth;
 	const char * const auth_str[WIFI_AUTH_MAX + 1] = {
 		"OPEN", "WEP", "WPA_PSK", "WPA2_PSK", "WPA_WPA2_PSK",
-		"WPA_WPA2_ENTERPRISE", "UNKNOWN"
+		"WPA_WPA2_ENTERPRISE", "WPA3_PSK", "WPA2_WPA3_PSK",
+		"WAPI_PSK", "OWE", "UNKNOWN"
 	};
 	int i;
 
 	for (i = 0; i < n_aps; i++) {
 		auth = MIN(ap[i].authmode, WIFI_AUTH_MAX);
-		LOGI("%s, %s, ch=%d, str=%d", ap[i].ssid, auth_str[auth],
-				ap[i].primary, ap[i].rssi);
+		LOGI("%s, %s, ch=%"PRIu8", str=%"PRId8, ap[i].ssid,
+				auth_str[auth], ap[i].primary, ap[i].rssi);
 	}
 
 	LOGI("That's all!");
@@ -350,7 +408,7 @@ static int build_scan_reply(const wifi_ap_record_t *ap, uint8_t n_aps,
 		ssid_len = strnlen((char*)ap[i].ssid, 32);
 		// Check if next entry fits along with end
 		if ((ssid_len + 5) >= LSD_MAX_LEN) {
-			LOGI("discarding %d entries", n_aps - i);
+			LOGI("discarding %"PRIu8" entries", n_aps - i);
 			break;
 		}
 		pos[0] = ap[i].authmode;
@@ -373,26 +431,17 @@ static esp_err_t wifi_init(void)
 	esp_err_t err;
 	wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
 	WIFI_CFG_FROM_NVS(ampdu_rx_enable);
-	WIFI_CFG_FROM_NVS(amsdu_rx_enable);
-	WIFI_CFG_FROM_NVS(left_continuous_rx_buf_num);
-	WIFI_CFG_FROM_NVS(qos_enable);
-	WIFI_CFG_FROM_NVS(rx_ampdu_buf_len);
-	WIFI_CFG_FROM_NVS(rx_ampdu_buf_num);
+	WIFI_CFG_FROM_NVS(ampdu_tx_enable);
+	WIFI_CFG_FROM_NVS(amsdu_tx_enable);
+	WIFI_CFG_FROM_NVS(static_rx_buf_num);
+	WIFI_CFG_FROM_NVS(dynamic_rx_buf_num);
+	WIFI_CFG_FROM_NVS(static_tx_buf_num);
+	WIFI_CFG_FROM_NVS(dynamic_tx_buf_num);
 	WIFI_CFG_FROM_NVS(rx_ba_win);
-	WIFI_CFG_FROM_NVS(rx_buf_len);
-	WIFI_CFG_FROM_NVS(rx_buf_num);
-	WIFI_CFG_FROM_NVS(rx_max_single_pkt_len);
-	WIFI_CFG_FROM_NVS(rx_pkt_num);
-	WIFI_CFG_FROM_NVS(tx_buf_num);
 
-	tcpip_adapter_init();
-
-	err = esp_event_loop_init(event_handler, d.q);
-	if (err) {
-		LOGE("failed to initialize event loop: %s",
-				esp_err_to_name(err));
-		goto out;
-	}
+	// TODO: check for errors
+	esp_netif_init();
+	esp_event_loop_create_default();
 
 	// Configure and start WiFi interface
 	err = esp_wifi_init(&wifi_cfg);
@@ -400,6 +449,13 @@ static esp_err_t wifi_init(void)
 		LOGE("wifi init failed: %s", esp_err_to_name(err));
 		goto out;
 	}
+
+	esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+				&event_handler, d.q);
+	esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+				&event_handler, d.q);
+
+
 	esp_wifi_set_storage(WIFI_STORAGE_RAM);
 	esp_wifi_set_mode(WIFI_MODE_STA);
 
@@ -428,7 +484,7 @@ static int wifi_scan(uint8_t phy_type, uint8_t *data)
 	}
 
 	esp_wifi_scan_get_ap_num(&n_aps);
-	LOGI("found %d APs", n_aps);
+	LOGI("found %"PRIu16" APs", n_aps);
 	ap = calloc(n_aps, sizeof(wifi_ap_record_t));
  	if (!ap) {
 		LOGE("out of memory!");
@@ -471,7 +527,7 @@ static int MwFsmTcpCon(MwMsgInAddr* addr) {
 	int err;
 	int s;
 
-	LOGI("Con. ch %d to %s:%s", addr->channel, addr->data,
+	LOGI("Con. ch %"PRIu8" to %s:%s", addr->channel, addr->data,
 			addr->dst_port);
 
 	err = MwChannelCheck(addr->channel);
@@ -501,7 +557,7 @@ static int MwFsmTcpCon(MwMsgInAddr* addr) {
 		return -1;
 	}
 
-	LOGI("... connected sock %d on ch %d", s, addr->channel);
+	LOGI("... connected sock %d on ch %"PRIu8, s, addr->channel);
 	freeaddrinfo(res);
 	// Record socket number, type and mark channel as in use.
 	d.sock[addr->channel - 1] = s;
@@ -554,17 +610,17 @@ static int MwFsmTcpBind(MwMsgBind *b) {
 	// Bind to address
 	if (lwip_bind(serv, (struct sockaddr*)&saddr, sizeof(saddr)) < -1) {
 		lwip_close(serv);
-		LOGE("Bind to port %d failed!", port);
+		LOGE("Bind to port %"PRIu16" failed!", port);
 		return -1;
 	}
 
 	// Listen for incoming connections
 	if (lwip_listen(serv, MW_MAX_SOCK) < 0) {
 		lwip_close(serv);
-		LOGE("Listen to port %d failed!", port);
+		LOGE("Listen to port %"PRIu16" failed!", port);
 		return -1;
 	}
-	LOGE("Listening to port %d.", port);
+	LOGE("Listening to port %"PRIu16, port);
 
 	// Fill in channel data
 	d.sock[b->channel - 1] = serv;
@@ -608,7 +664,7 @@ static int MwUdpSet(MwMsgInAddr* addr) {
 	local.sin_port = lwip_htons(local_port);
 	if (remote_port && addr->data[0]) {
 		// Communication with remote peer
-		LOGE("UDP ch %d, port %d to addr %s:%d.", addr->channel,
+		LOGE("UDP ch %"PRIu8", port %u to addr %s:%u.", addr->channel,
 				local_port, addr->data, remote_port);
 
 		err = net_dns_lookup(addr->data, addr->dst_port, &raddr);
@@ -620,7 +676,7 @@ static int MwUdpSet(MwMsgInAddr* addr) {
 		freeaddrinfo(raddr);
 	} else if (local_port) {
 		// Server in reuse mode
-		LOGI("UDP ch %d, src port %d.", addr->channel, local_port);
+		LOGI("UDP ch %"PRIu8", src port %u.", addr->channel, local_port);
 		d.raddr[idx] = local;
 	} else {
 		LOGE("Invalid UDP socket data");
@@ -667,17 +723,13 @@ static void MwSetDefaultCfg(void) {
 	cfg.defaultAp = -1;
 	// Default WiFi config, from menuconfig parameters
 	cfg.wifi.ampdu_rx_enable = WIFI_AMPDU_RX_ENABLED;
-	cfg.wifi.amsdu_rx_enable = WIFI_AMSDU_RX_ENABLED;
-	cfg.wifi.left_continuous_rx_buf_num = CONFIG_ESP8266_WIFI_LEFT_CONTINUOUS_RX_BUFFER_NUM;
-	cfg.wifi.qos_enable = WIFI_QOS_ENABLED;
-	cfg.wifi.rx_ampdu_buf_len = WIFI_AMPDU_RX_AMPDU_BUF_LEN;
-	cfg.wifi.rx_ampdu_buf_num = WIFI_AMPDU_RX_AMPDU_BUF_NUM;
-	cfg.wifi.rx_ba_win = WIFI_AMPDU_RX_BA_WIN;
-	cfg.wifi.rx_buf_len = WIFI_HW_RX_BUFFER_LEN;
-	cfg.wifi.rx_buf_num = CONFIG_ESP8266_WIFI_RX_BUFFER_NUM;
-	cfg.wifi.rx_max_single_pkt_len = WIFI_RX_MAX_SINGLE_PKT_LEN;
-	cfg.wifi.rx_pkt_num = CONFIG_ESP8266_WIFI_RX_PKT_NUM;
-	cfg.wifi.tx_buf_num = CONFIG_ESP8266_WIFI_TX_PKT_NUM;
+	cfg.wifi.ampdu_tx_enable = WIFI_AMPDU_TX_ENABLED;
+	cfg.wifi.amsdu_tx_enable = WIFI_AMSDU_TX_ENABLED;
+	cfg.wifi.static_rx_buf_num = CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM;
+	cfg.wifi.dynamic_rx_buf_num = CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM;
+	cfg.wifi.static_tx_buf_num = WIFI_STATIC_TX_BUFFER_NUM;
+	cfg.wifi.dynamic_tx_buf_num = WIFI_DYNAMIC_TX_BUFFER_NUM;
+	cfg.wifi.rx_ba_win = WIFI_DEFAULT_RX_BA_WIN;
 	// Copy the default timezone and NTP servers
 	*(1 + StrCpyDst(1 + StrCpyDst(1 + StrCpyDst(1 + StrCpyDst(cfg.ntpPool,
 		MW_TZ_DEF), MW_SNTP_SERV_0), MW_SNTP_SERV_1), MW_SNTP_SERV_2)) =
@@ -726,8 +778,6 @@ static int mw_nv_cfg_save(void) {
 	return 0;
 }
 
-void MwApCfg(void) {
-}
 // Load configuration from flash. Return 0 if configuration was successfully
 // loaded and verified, 1 if configuration check did not pass and default
 // configuration has been loaded instead.
@@ -761,11 +811,12 @@ int MwCfgLoad(void) {
 
 static void SetIpCfg(int slot) {
 	esp_err_t err;
+	esp_netif_t *net = esp_netif_get_default_netif();
 
 	if ((cfg.ip[slot].ip.addr) && (cfg.ip[slot].netmask.addr)
 				&& (cfg.ip[slot].gw.addr)) {
-		tcpip_adapter_dhcpc_stop(TCPIP_ADAPTER_IF_STA);
-		err = tcpip_adapter_set_ip_info(TCPIP_ADAPTER_IF_STA, &cfg.ip[slot]);
+		esp_netif_dhcpc_stop(net);
+		err = esp_netif_set_ip_info(net, &cfg.ip[slot]);
 		if (!err) {
 			LOGI("static IP configuration %d set", slot);
 			// Set DNS servers if available
@@ -778,11 +829,11 @@ static void SetIpCfg(int slot) {
 		} else {
 			LOGE("failed setting static IP configuration %d: %s",
 					slot, esp_err_to_name(err));
-			tcpip_adapter_dhcpc_start(TCPIP_ADAPTER_IF_STA);
+			esp_netif_dhcpc_start(net);
 		}
 	} else {
 		LOGI("setting DHCP IP configuration.");
-		tcpip_adapter_dhcpc_start(TCPIP_ADAPTER_IF_STA);
+		esp_netif_dhcpc_start(net);
 	}
 }
 
@@ -795,10 +846,10 @@ void MwApJoin(uint8_t n) {
 	d.phy = cfg.ap[n].phy;
 	esp_wifi_set_config(ESP_IF_WIFI_STA, &if_cfg);
 	esp_wifi_start();
-	tcpip_adapter_set_hostname(TCPIP_ADAPTER_IF_STA, "MegaWiFi-"
+	esp_netif_set_hostname(esp_netif_get_default_netif(), "MegaWiFi-"
 			STR(MW_FW_VERSION_MAJOR) "-"
 			STR(MW_FW_VERSION_MINOR));
-	LOGI("AP ASSOC %d", n);
+	LOGI("AP ASSOC %"PRIu8, n);
 	d.s.sys_stat = MW_ST_AP_JOIN;
 	d.n_reassoc = 0;
 }
@@ -806,7 +857,7 @@ void MwApJoin(uint8_t n) {
 void MwSysStatFill(MwCmd *rep) {
 	rep->datalen = htons(sizeof(MwMsgSysStat));
 	rep->sysStat.st_flags = htonl(d.s.st_flags);
-	LOGD("stat flags: 0x%04X, len: %d", d.s.st_flags,
+	LOGD("stat flags: 0x%04"PRIX32", len: %zd", d.s.st_flags,
 			sizeof(MwMsgSysStat));
 }
 
@@ -849,40 +900,39 @@ static void sntp_set_config(void)
 	tzset();
 
 	for (int i = 1; i < num_tokens; i++) {
-		sntp_setservername(i - 1, (char*)token[i]);
+		esp_sntp_setservername(i - 1, (char*)token[i]);
 		LOGI("SNTP server: %s", token[i]);
 	}
 }
 
-#define PRINT_WIFI_CFG(param) LOGI(#param " = %d", cfg.wifi.param)
+#define PRINT_WIFI_CFG(param) LOGI(#param " = %"PRIu8, cfg.wifi.param)
 static void wifi_cfg_log(void)
 {
 	PRINT_WIFI_CFG(ampdu_rx_enable);
-	PRINT_WIFI_CFG(amsdu_rx_enable);
-	PRINT_WIFI_CFG(left_continuous_rx_buf_num);
-	PRINT_WIFI_CFG(qos_enable);
-	PRINT_WIFI_CFG(rx_ampdu_buf_len);
-	PRINT_WIFI_CFG(rx_ampdu_buf_num);
+	PRINT_WIFI_CFG(ampdu_tx_enable);
+	PRINT_WIFI_CFG(amsdu_tx_enable);
+	PRINT_WIFI_CFG(static_rx_buf_num);
+	PRINT_WIFI_CFG(dynamic_rx_buf_num);
+	PRINT_WIFI_CFG(static_tx_buf_num);
+	PRINT_WIFI_CFG(dynamic_tx_buf_num);
 	PRINT_WIFI_CFG(rx_ba_win);
-	PRINT_WIFI_CFG(rx_buf_len);
-	PRINT_WIFI_CFG(rx_buf_num);
-	PRINT_WIFI_CFG(rx_max_single_pkt_len);
-	PRINT_WIFI_CFG(rx_pkt_num);
-	PRINT_WIFI_CFG(tx_buf_num);
 }
 
-// SDK function, but dunno why it is not exported
-extern uint32_t spi_flash_get_id(void);
 static void print_flash_id(void)
 {
-	uint32_t id = spi_flash_get_id();
+	uint32_t id, len;
 	char *byte = (char*)&id;
+
+	// Using NULL as spi chip, gets the default one
+	esp_flash_read_id(NULL, &id);
+	esp_flash_get_physical_size(NULL, &len);
 
 	d.flash_man = byte[0];
 	d.flash_dev = (byte[1]<<8) | byte[2];
 
-	LOGI("flash manufacturer: %02X, device %04X", d.flash_man, d.flash_dev);
-	LOGI("configured SPI length: %d", spi_flash_get_chip_size());
+	LOGI("flash manufacturer: %02"PRIX8", device %04"PRIX16,
+			d.flash_man, d.flash_dev);
+	LOGI("SPI chip length: %"PRIu32, len);
 }
 
 #define PANIC(...) do { \
@@ -947,9 +997,9 @@ int MwInit(void) {
 	}
 	// Initialize SNTP
 	// TODO: Maybe this should be moved to the "READY" state
-	sntp_setoperatingmode(SNTP_OPMODE_POLL);
+	esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
 	sntp_set_config();
-	sntp_init();
+	esp_sntp_init();
 	// Initialize LSD layer (will create receive task among other stuff).
 	LsdInit(d.q);
 	LsdChEnable(MW_CTRL_CH);
@@ -1076,23 +1126,13 @@ static int parse_wifi_adv_get(MwCmd *reply)
 
 	wifi_cfg_log();
 	FILL_REP_FROM_CFG(ampdu_rx_enable);
-	FILL_REP_FROM_CFG(amsdu_rx_enable);
-	FILL_REP_FROM_CFG(left_continuous_rx_buf_num);
-	FILL_REP_FROM_CFG(qos_enable);
-	FILL_REP_FROM_CFG(rx_ampdu_buf_len);
-	FILL_REP_FROM_CFG(rx_ampdu_buf_num);
+	FILL_REP_FROM_CFG(ampdu_tx_enable);
+	FILL_REP_FROM_CFG(amsdu_tx_enable);
+	FILL_REP_FROM_CFG(static_rx_buf_num);
+	FILL_REP_FROM_CFG(dynamic_rx_buf_num);
+	FILL_REP_FROM_CFG(static_tx_buf_num);
+	FILL_REP_FROM_CFG(dynamic_tx_buf_num);
 	FILL_REP_FROM_CFG(rx_ba_win);
-	FILL_REP_FROM_CFG(rx_buf_len);
-	FILL_REP_FROM_CFG(rx_buf_num);
-	FILL_REP_FROM_CFG(rx_max_single_pkt_len);
-	FILL_REP_FROM_CFG(rx_pkt_num);
-	FILL_REP_FROM_CFG(tx_buf_num);
-
-	reply->wifi_adv_cfg.rx_max_single_pkt_len =
-		htonl(reply->wifi_adv_cfg.rx_max_single_pkt_len);
-	reply->wifi_adv_cfg.rx_buf_len = htonl(reply->wifi_adv_cfg.rx_buf_len);
-	reply->wifi_adv_cfg.rx_ampdu_buf_len =
-		htonl(reply->wifi_adv_cfg.rx_ampdu_buf_len);
 
 	reply->datalen = htons(len);
 
@@ -1100,12 +1140,12 @@ static int parse_wifi_adv_get(MwCmd *reply)
 }
 
 #define THRESHOLD_MAX_CHECK(val, max) if (wifi->val > (max)) { \
-	LOGE(#val " check failed: %d < %d", wifi->val, max); \
+	LOGE(#val " check failed: %d < %d", (int)wifi->val, (int)max); \
 	goto err; \
 }
 
 #define THRESHOLD_MAX_MIN_CHECK(val, min, max) if (wifi->val < (min) || wifi->val > (max)) { \
-	LOGE(#val " check failed: %d [%d,%d]", wifi->val, min, max); \
+	LOGE(#val " check failed: %d [%d,%d]", (int)wifi->val, (int)min, (int)max); \
 	goto err; \
 }
 
@@ -1116,36 +1156,29 @@ static int parse_wifi_adv_get(MwCmd *reply)
 // Changes required to be saved and a reboot to be effective
 static void parse_wifi_adv_set(struct mw_wifi_adv_cfg *wifi, MwCmd *reply)
 {
-	wifi->rx_max_single_pkt_len = ntohl(wifi->rx_max_single_pkt_len);
-	wifi->rx_buf_len = ntohl(wifi->rx_buf_len);
-	wifi->rx_ampdu_buf_len = ntohl(wifi->rx_ampdu_buf_len);
-
-	THRESHOLD_MAX_CHECK(left_continuous_rx_buf_num, 16);
+	THRESHOLD_MAX_MIN_CHECK(static_rx_buf_num, 2, 25);
+	THRESHOLD_MAX_CHECK(dynamic_rx_buf_num, 128);
+	THRESHOLD_MAX_MIN_CHECK(static_tx_buf_num, 1, 64);
+	THRESHOLD_MAX_MIN_CHECK(static_tx_buf_num, 1, 128);
 	THRESHOLD_MAX_CHECK(rx_ba_win, 16);
-	THRESHOLD_MAX_MIN_CHECK(rx_buf_num, 14, 28);
-	THRESHOLD_MAX_MIN_CHECK(rx_pkt_num, 4, 16);
-	THRESHOLD_MAX_MIN_CHECK(tx_buf_num, 4, 16);
 
 	if (!wifi->ampdu_rx_enable) {
 		if (wifi->rx_ba_win) {
-			LOGE("rx_ba_win %d not allowed with AMPDU", wifi->rx_ba_win);
+			LOGE("rx_ba_win %"PRIu8" not allowed with AMPDU",
+					wifi->rx_ba_win);
 			goto err;
 		}
 	}
 
 	// Checks passed, copy configuration
 	FILL_CFG_FROM_REQ(ampdu_rx_enable);
-	FILL_CFG_FROM_REQ(amsdu_rx_enable);
-	FILL_CFG_FROM_REQ(left_continuous_rx_buf_num);
-	FILL_CFG_FROM_REQ(qos_enable);
-	FILL_CFG_FROM_REQ(rx_ampdu_buf_len);
-	FILL_CFG_FROM_REQ(rx_ampdu_buf_num);
+	FILL_CFG_FROM_REQ(ampdu_tx_enable);
+	FILL_CFG_FROM_REQ(amsdu_tx_enable);
+	FILL_CFG_FROM_REQ(static_rx_buf_num);
+	FILL_CFG_FROM_REQ(dynamic_rx_buf_num);
+	FILL_CFG_FROM_REQ(static_tx_buf_num);
+	FILL_CFG_FROM_REQ(dynamic_tx_buf_num);
 	FILL_CFG_FROM_REQ(rx_ba_win);
-	FILL_CFG_FROM_REQ(rx_buf_len);
-	FILL_CFG_FROM_REQ(rx_buf_num);
-	FILL_CFG_FROM_REQ(rx_max_single_pkt_len);
-	FILL_CFG_FROM_REQ(rx_pkt_num);
-	FILL_CFG_FROM_REQ(tx_buf_num);
 
 	wifi_cfg_log();
 
@@ -1169,23 +1202,23 @@ static void ap_cfg_set(uint8_t num, uint8_t phy_type, const char *ssid,
 		const char *pass, MwCmd *reply)
 {
 	if (num >= MW_NUM_AP_CFGS) {
-		LOGE("tried to set AP for cfg %d", num);
+		LOGE("tried to set AP for cfg %"PRIu8, num);
 		reply->cmd = htons(MW_CMD_ERROR);
 	} else if (phy_type != WIFI_PROTOCOL_11B &&
 			phy_type != (WIFI_PROTOCOL_11B + WIFI_PROTOCOL_11G) &&
 			phy_type != (WIFI_PROTOCOL_11B + WIFI_PROTOCOL_11G +
 				WIFI_PROTOCOL_11N)) {
-		LOGE("PHY type 0x%X not supported", phy_type);
+		LOGE("PHY type 0x%"PRIX8" not supported", phy_type);
 		reply->cmd = htons(MW_CMD_ERROR);
 	} else {
 		// Copy configuration and save it to flash
-		LOGI("setting AP configuration %d...", num);
+		LOGI("setting AP configuration %"PRIu8"...", num);
 		strncpy(cfg.ap[num].ssid, ssid, MW_SSID_MAXLEN);
 		strncpy(cfg.ap[num].pass, pass, MW_PASS_MAXLEN);
 		cfg.ap[num].phy = phy_type;
 		cfg.ap[num].reserved[0] = cfg.ap[num].reserved[1] =
 			 cfg.ap[num].reserved[2] = 0;
-		LOGI("phy %d, ssid: %s, pass: %s", phy_type, ssid, pass);
+		LOGI("phy %"PRIu8", ssid: %s, pass: %s", phy_type, ssid, pass);
 		cfg.defaultAp = num;
 	}
 }
@@ -1261,498 +1294,500 @@ int MwFsmCmdProc(MwCmd *c, uint16_t totalLen) {
 	// Sanity check: total Lengt - header length = data length
 	if ((totalLen - MW_CMD_HEADLEN) != len) {
 		LOGE("ERROR: Length inconsistent");
-		LOGE("totalLen=%d, dataLen=%d", totalLen, len);
+		LOGE("totalLen=%"PRIu16", dataLen=%"PRIu16, totalLen, len);
 		return MW_CMD_FMT_ERROR;
 	}
 
 	// parse command
-	LOGI("CmdRequest: %d", ByteSwapWord(c->cmd));
+	LOGI("CmdRequest: %"PRIu16, ByteSwapWord(c->cmd));
 	reply_set_ok_empty(&reply);
 	switch (ByteSwapWord(c->cmd)) {
-		case MW_CMD_VERSION:
-			// Cancel sleep timer
-			if (d.tim) {
-				xTimerStop(d.tim, 0);
-				xTimerDelete(d.tim, 0);
-				d.tim = NULL;
-			}
-			reply.cmd = MW_CMD_OK;
-			reply.datalen = ByteSwapWord(3 + sizeof(MW_FW_VARIANT));
-			reply.data[0] = MW_FW_VERSION_MAJOR;
-			reply.data[1] = MW_FW_VERSION_MINOR;
-			reply.data[2] = MW_FW_VERSION_MICRO;
-			memcpy(reply.data + 3, MW_FW_VARIANT, sizeof(MW_FW_VARIANT));
-			LsdSend((uint8_t*)&reply, ByteSwapWord(reply.datalen) +
-					MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_VERSION:
+		// Cancel sleep timer
+		if (d.tim) {
+			xTimerStop(d.tim, 0);
+			xTimerDelete(d.tim, 0);
+			d.tim = NULL;
+		}
+		reply.cmd = MW_CMD_OK;
+		reply.datalen = ByteSwapWord(3 + sizeof(MW_FW_VARIANT));
+		reply.data[0] = MW_FW_VERSION_MAJOR;
+		reply.data[1] = MW_FW_VERSION_MINOR;
+		reply.data[2] = MW_FW_VERSION_MICRO;
+		memcpy(reply.data + 3, MW_FW_VARIANT, sizeof(MW_FW_VARIANT));
+		LsdSend((uint8_t*)&reply, ByteSwapWord(reply.datalen) +
+				MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_ECHO:		// Echo request
-			reply.datalen = c->datalen;
-			LOGI("SENDING ECHO!");
-			// Send the command response
-			if ((LsdSplitStart((uint8_t*)&reply, MW_CMD_HEADLEN,
-					len + MW_CMD_HEADLEN, 0) == MW_CMD_HEADLEN) &&
-					len) {
-				// Send echoed data
-				LsdSplitEnd(c->data, len);
-			}
-			break;
+	case MW_CMD_ECHO:		// Echo request
+		reply.datalen = c->datalen;
+		LOGI("SENDING ECHO!");
+		// Send the command response
+		if ((LsdSplitStart((uint8_t*)&reply, MW_CMD_HEADLEN,
+				len + MW_CMD_HEADLEN, 0) == MW_CMD_HEADLEN) &&
+				len) {
+			// Send echoed data
+			LsdSplitEnd(c->data, len);
+		}
+		break;
 
-		case MW_CMD_AP_SCAN:
-	    		LOGI("SCAN!");
-			int scan_len = wifi_scan(c->data[0], reply.data);
-			if (scan_len <= 0) {
-				reply.cmd = ByteSwapWord(MW_CMD_ERROR);
-			} else {
-				reply.datalen = scan_len;
-				reply.datalen = ByteSwapWord(reply.datalen);
-			}
-			LsdSend((uint8_t*)&reply, scan_len + MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_AP_SCAN:
+    		LOGI("SCAN!");
+		int scan_len = wifi_scan(c->data[0], reply.data);
+		if (scan_len <= 0) {
+			reply.cmd = ByteSwapWord(MW_CMD_ERROR);
+		} else {
+			reply.datalen = scan_len;
+			reply.datalen = ByteSwapWord(reply.datalen);
+		}
+		LsdSend((uint8_t*)&reply, scan_len + MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_AP_CFG:
-			ap_cfg_set(c->apCfg.cfgNum, c->apCfg.phy_type, c->apCfg.ssid,
-					c->apCfg.pass, &reply);
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_AP_CFG:
+		ap_cfg_set(c->apCfg.cfgNum, c->apCfg.phy_type, c->apCfg.ssid,
+				c->apCfg.pass, &reply);
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_AP_CFG_GET:
-			tmp = c->apCfg.cfgNum;
-			if (tmp >= MW_NUM_AP_CFGS) {
-				LOGE("Requested AP for cfg %d!", tmp);
-				reply.cmd = ByteSwapWord(MW_CMD_ERROR);
-				replen = 0;
-			} else {
-				LOGI("Getting AP configuration %d...", tmp);
-				replen = sizeof(MwMsgApCfg);
-				reply.datalen = ByteSwapWord(sizeof(MwMsgApCfg));
-				reply.apCfg.cfgNum = c->apCfg.cfgNum;
-				strncpy(reply.apCfg.ssid, cfg.ap[tmp].ssid, MW_SSID_MAXLEN);
-				strncpy(reply.apCfg.pass, cfg.ap[tmp].pass, MW_PASS_MAXLEN);
-				reply.apCfg.phy_type = cfg.ap[tmp].phy;
-				LOGI("phy: 0x%X, ssid: %s, pass: %s", reply.apCfg.phy_type,
-						reply.apCfg.ssid, reply.apCfg.pass);
-			} 
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + replen, 0);
-			break;
-
-		case MW_CMD_IP_CURRENT:
+	case MW_CMD_AP_CFG_GET:
+		tmp = c->apCfg.cfgNum;
+		if (tmp >= MW_NUM_AP_CFGS) {
+			LOGE("Requested AP for cfg %"PRIu16"!", tmp);
+			reply.cmd = ByteSwapWord(MW_CMD_ERROR);
 			replen = 0;
-			LOGI("Getting current IP configuration...");
+		} else {
+			LOGI("Getting AP configuration %"PRIu16"...", tmp);
+			replen = sizeof(MwMsgApCfg);
+			reply.datalen = ByteSwapWord(sizeof(MwMsgApCfg));
+			reply.apCfg.cfgNum = c->apCfg.cfgNum;
+			strncpy(reply.apCfg.ssid, cfg.ap[tmp].ssid, MW_SSID_MAXLEN);
+			strncpy(reply.apCfg.pass, cfg.ap[tmp].pass, MW_PASS_MAXLEN);
+			reply.apCfg.phy_type = cfg.ap[tmp].phy;
+			LOGI("phy: 0x%"PRIX8", ssid: %s, pass: %s", reply.apCfg.phy_type,
+					reply.apCfg.ssid, reply.apCfg.pass);
+		} 
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + replen, 0);
+		break;
+
+	case MW_CMD_IP_CURRENT:
+		replen = 0;
+		LOGI("Getting current IP configuration...");
+		replen = sizeof(MwMsgIpCfg);
+		reply.datalen = ByteSwapWord(sizeof(MwMsgIpCfg));
+		reply.ipCfg.cfgNum = 0;
+		esp_netif_get_ip_info(esp_netif_get_default_netif(),
+				&reply.ipCfg.cfg);
+		reply.ipCfg.dns1.addr = dns_getserver(0)->addr;
+		reply.ipCfg.dns2.addr = dns_getserver(1)->addr;
+		log_ip_cfg(&reply.ipCfg);
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + replen, 0);
+		break;
+
+	case MW_CMD_IP_CFG:
+		tmp = (uint8_t)c->ipCfg.cfgNum;
+		if (tmp >= MW_NUM_AP_CFGS) {
+			LOGE("Tried to set IP for cfg %"PRIu16"!", tmp);
+			reply.cmd = ByteSwapWord(MW_CMD_ERROR);
+		} else {
+			LOGI("Setting IP configuration %"PRIu16"...", tmp);
+			cfg.ip[tmp] = c->ipCfg.cfg;
+			cfg.dns[tmp][0].addr = c->ipCfg.dns1.addr;
+			cfg.dns[tmp][1].addr = c->ipCfg.dns2.addr;
+			log_ip_cfg(&c->ipCfg);
+		}
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
+
+	case MW_CMD_IP_CFG_GET:
+		tmp = c->ipCfg.cfgNum;
+		replen = 0;
+		if (tmp >= MW_NUM_AP_CFGS) {
+			LOGE("Requested IP for cfg %"PRIu16"!", tmp);
+			reply.cmd = ByteSwapWord(MW_CMD_ERROR);
+		} else {
+			LOGI("Getting IP configuration %"PRIu16"...", tmp);
 			replen = sizeof(MwMsgIpCfg);
 			reply.datalen = ByteSwapWord(sizeof(MwMsgIpCfg));
-			reply.ipCfg.cfgNum = 0;
-			tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_STA, &reply.ipCfg.cfg);
-			reply.ipCfg.dns1 = *dns_getserver(0);
-			reply.ipCfg.dns2 = *dns_getserver(1);
+			reply.ipCfg.cfgNum = c->ipCfg.cfgNum;
+			reply.ipCfg.cfg = cfg.ip[tmp];
+			reply.ipCfg.dns1.addr = cfg.dns[tmp][0].addr;
+			reply.ipCfg.dns2.addr = cfg.dns[tmp][1].addr;
 			log_ip_cfg(&reply.ipCfg);
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + replen, 0);
-			break;
+		}
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + replen, 0);
+		break;
 
-		case MW_CMD_IP_CFG:
-			tmp = (uint8_t)c->ipCfg.cfgNum;
-			if (tmp >= MW_NUM_AP_CFGS) {
-				LOGE("Tried to set IP for cfg %d!", tmp);
-				reply.cmd = ByteSwapWord(MW_CMD_ERROR);
-			} else {
-				LOGI("Setting IP configuration %d...", tmp);
-				cfg.ip[tmp] = c->ipCfg.cfg;
-				cfg.dns[tmp][0] = c->ipCfg.dns1;
-				cfg.dns[tmp][1] = c->ipCfg.dns2;
-				log_ip_cfg(&c->ipCfg);
-			}
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_DEF_AP_CFG:
+		tmp = c->data[0];
+		if (tmp < MW_NUM_AP_CFGS) {
+			cfg.defaultAp = tmp;
+		}
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_IP_CFG_GET:
-			tmp = c->ipCfg.cfgNum;
-			replen = 0;
-			if (tmp >= MW_NUM_AP_CFGS) {
-				LOGE("Requested IP for cfg %d!", tmp);
-				reply.cmd = ByteSwapWord(MW_CMD_ERROR);
-			} else {
-				LOGI("Getting IP configuration %d...", tmp);
-				replen = sizeof(MwMsgIpCfg);
-				reply.datalen = ByteSwapWord(sizeof(MwMsgIpCfg));
-				reply.ipCfg.cfgNum = c->ipCfg.cfgNum;
-				reply.ipCfg.cfg = cfg.ip[tmp];
-				reply.ipCfg.dns1 = cfg.dns[tmp][0];
-				reply.ipCfg.dns2 = cfg.dns[tmp][1];
-				log_ip_cfg(&reply.ipCfg);
-			}
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + replen, 0);
-			break;
+	case MW_CMD_DEF_AP_CFG_GET:
+		reply.datalen = ByteSwapWord(1);
+		reply.data[0] = cfg.defaultAp;
+		LOGI("Sending default AP: %d", cfg.defaultAp);
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + 1, 0);
+		break;
 
-		case MW_CMD_DEF_AP_CFG:
-			tmp = c->data[0];
-			if (tmp < MW_NUM_AP_CFGS) {
-				cfg.defaultAp = tmp;
-			}
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_AP_JOIN:
+		// Start connecting to AP and jump to AP_JOIN state
+		if ((c->data[0] >= MW_NUM_AP_CFGS) ||
+				!(cfg.ap[c->data[0]].ssid[0])) {
+			reply.cmd = ByteSwapWord(MW_CMD_ERROR);
+			LOGE("Invalid AP_JOIN on config %"PRIu8, c->data[0]);
+		} else {
+			MwApJoin(c->data[0]);
+		}
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_DEF_AP_CFG_GET:
+	case MW_CMD_AP_LEAVE:	// Leave access point
+		LOGI("Disconnecting from AP");
+		disconnect();
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
+
+	case MW_CMD_TCP_CON:
+		LOGI("TRYING TO CONNECT TCP SOCKET...");
+		if (MwFsmTcpCon(&c->inAddr) < 0) {
+			reply.cmd = ByteSwapWord(MW_CMD_ERROR);
+		}
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
+
+	case MW_CMD_TCP_BIND:
+		if (MwFsmTcpBind(&c->bind)) {
+			reply.cmd = ByteSwapWord(MW_CMD_ERROR);
+		}
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
+
+	case MW_CMD_CLOSE:
+		// If channel number OK, disconnect the socket on requested channel
+		if ((c->data[0] > 0) && (c->data[0] <= LSD_MAX_CH) &&
+				d.ss[c->data[0] - 1]) {
+			LOGI("Closing socket %d from channel %d",
+					d.sock[c->data[0] - 1], c->data[0]);
+			MwSockClose(c->data[0]);
+			LsdChDisable(c->data[0]);
+		} else {
+			reply.cmd = ByteSwapWord(MW_CMD_ERROR);
+			LOGE("Requested disconnect of not opened channel %d.",
+					c->data[0]);
+		}
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
+
+	case MW_CMD_UDP_SET:
+		LOGI("Configuring UDP socket...");
+		if (MwUdpSet(&c->inAddr) < 0) {
+			reply.cmd = ByteSwapWord(MW_CMD_ERROR);
+		}
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
+
+	case MW_CMD_SOCK_STAT:
+		if ((c->data[0] > 0) && (c->data[0] < LSD_MAX_CH)) {
+			// Send channel status and clear channel event flag
+			replen = 1;
 			reply.datalen = ByteSwapWord(1);
-			reply.data[0] = cfg.defaultAp;
-			LOGI("Sending default AP: %d", cfg.defaultAp);
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + 1, 0);
-			break;
+			reply.data[0] = (uint8_t)d.ss[c->data[0] - 1];
+			MwFsmClearChEvent(c->data[0]);
+		} else {
+			replen = 0;
+			reply.cmd = ByteSwapWord(MW_CMD_ERROR);
+			LOGE("Requested unavailable channel!");
+		}
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + replen, 0);
+		break;
 
-		case MW_CMD_AP_JOIN:
-			// Start connecting to AP and jump to AP_JOIN state
-			if ((c->data[0] >= MW_NUM_AP_CFGS) ||
-					!(cfg.ap[c->data[0]].ssid[0])) {
-				reply.cmd = ByteSwapWord(MW_CMD_ERROR);
-				LOGE("Invalid AP_JOIN on config %d", c->data[0]);
-			} else {
-				MwApJoin(c->data[0]);
-			}
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_PING:
+		LOGE("PING unimplemented");
+		break;
 
-		case MW_CMD_AP_LEAVE:	// Leave access point
-			LOGI("Disconnecting from AP");
-			disconnect();
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_SNTP_CFG:
+		LOGI("setting SNTP cfg for zone %s", c->data);
+		sntp_config_set((char*)c->data, len, &reply);
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_TCP_CON:
-			LOGI("TRYING TO CONNECT TCP SOCKET...");
-			if (MwFsmTcpCon(&c->inAddr) < 0) {
-				reply.cmd = ByteSwapWord(MW_CMD_ERROR);
-			}
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_SNTP_CFG_GET:
+		replen = cfg.ntpPoolLen;
+		LOGI("sending SNTP cfg (%d bytes)", replen);
+		memcpy(reply.data, cfg.ntpPool, replen);
+		reply.datalen = htons(replen);
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + replen, 0);
+		break;
 
-		case MW_CMD_TCP_BIND:
-			if (MwFsmTcpBind(&c->bind)) {
-				reply.cmd = ByteSwapWord(MW_CMD_ERROR);
-			}
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_DATETIME:
+		ts = time(NULL);
+		reply.datetime.dtBin[0] = 0;
+		reply.datetime.dtBin[1] = ByteSwapDWord((uint32_t)ts);
+		strcpy(reply.datetime.dtStr, ctime(&ts));
+		LOGI("sending datetime %s", reply.datetime.dtStr);
+		tmp = 2*sizeof(uint32_t) + strlen(reply.datetime.dtStr);
+		reply.datalen = ByteSwapWord(tmp);
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + tmp, 0);
+		break;
 
-		case MW_CMD_CLOSE:
-			// If channel number OK, disconnect the socket on requested channel
-			if ((c->data[0] > 0) && (c->data[0] <= LSD_MAX_CH) &&
-					d.ss[c->data[0] - 1]) {
-				LOGI("Closing socket %d from channel %d",
-						d.sock[c->data[0] - 1], c->data[0]);
-				MwSockClose(c->data[0]);
-				LsdChDisable(c->data[0]);
-			} else {
-				reply.cmd = ByteSwapWord(MW_CMD_ERROR);
-				LOGE("Requested disconnect of not opened channel %d.",
-						c->data[0]);
-			}
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_DT_SET:
+		LOGE("DT_SET unimplemented");
+		break;
 
-		case MW_CMD_UDP_SET:
-			LOGI("Configuring UDP socket...");
-			if (MwUdpSet(&c->inAddr) < 0) {
-				reply.cmd = ByteSwapWord(MW_CMD_ERROR);
-			}
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_FLASH_WRITE:
+		if (flash_write(ntohl(c->flData.addr),
+					len - sizeof(uint32_t),
+					(char*)c->flData.data)) {
+			reply.cmd = ByteSwapWord(MW_CMD_ERROR);
+		}
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_SOCK_STAT:
-			if ((c->data[0] > 0) && (c->data[0] < LSD_MAX_CH)) {
-				// Send channel status and clear channel event flag
-				replen = 1;
-				reply.datalen = ByteSwapWord(1);
-				reply.data[0] = (uint8_t)d.ss[c->data[0] - 1];
-				MwFsmClearChEvent(c->data[0]);
-			} else {
-				replen = 0;
-				reply.cmd = ByteSwapWord(MW_CMD_ERROR);
-				LOGE("Requested unavailable channel!");
-			}
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + replen, 0);
-			break;
+	case MW_CMD_FLASH_READ:
+		c->flRange.addr = ntohl(c->flRange.addr);
+		c->flRange.len = ntohs(c->flRange.len);
+		if (flash_read(c->flRange.addr, c->flRange.len,
+					(char*)reply.data)) {
+			reply.cmd = ByteSwapWord(MW_CMD_ERROR);
+			c->flRange.len = 0;
+		}
+		LsdSend((uint8_t*)&reply, c->flRange.len + MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_PING:
-			LOGE("PING unimplemented");
-			break;
+	case MW_CMD_FLASH_ERASE:
+		if (flash_erase(ntohs(c->flSect))) {
+			reply.cmd = ByteSwapWord(MW_CMD_ERROR);
+		}
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_SNTP_CFG:
-			LOGI("setting SNTP cfg for zone %s", c->data);
-			sntp_config_set((char*)c->data, len, &reply);
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_FLASH_ID:
+		reply.flash_id.device = htons(d.flash_dev);
+		reply.flash_id.manufacturer = d.flash_man;
+		reply.datalen = htons(3);
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + 3, 0);
+		break;
 
-		case MW_CMD_SNTP_CFG_GET:
-			replen = cfg.ntpPoolLen;
-			LOGI("sending SNTP cfg (%d bytes)", replen);
-			memcpy(reply.data, cfg.ntpPool, replen);
-			reply.datalen = htons(replen);
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + replen, 0);
-			break;
+	case MW_CMD_SYS_STAT:
+		MwSysStatFill(&reply);
+		LOGI("%02X %02X %02X %02X", reply.data[0], reply.data[1],
+				reply.data[2], reply.data[3]);
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + sizeof(MwMsgSysStat),
+			0);
+		break;
 
-		case MW_CMD_DATETIME:
-			ts = time(NULL);
-			reply.datetime.dtBin[0] = 0;
-			reply.datetime.dtBin[1] = ByteSwapDWord((uint32_t)ts);
-			strcpy(reply.datetime.dtStr, ctime(&ts));
-			LOGI("sending datetime %s", reply.datetime.dtStr);
-			tmp = 2*sizeof(uint32_t) + strlen(reply.datetime.dtStr);
-			reply.datalen = ByteSwapWord(tmp);
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + tmp, 0);
-			break;
+	case MW_CMD_DEF_CFG_SET:
+		// Check lengt and magic value
+		if ((len != 4) || (c->dwData[0] !=
+					ByteSwapDWord(MW_FACT_RESET_MAGIC))) {
+			LOGE("Wrong DEF_CFG_SET command invocation!");
+			reply.cmd = ByteSwapWord(MW_CMD_ERROR);
+		} else if (esp_partition_erase_range(d.p_cfg, 0,
+					MW_CFG_SECT_LEN) != ESP_OK) {
+			LOGE("Config flash sector erase failed!");
+			reply.cmd = ByteSwapWord(MW_CMD_ERROR);
+		} else {
+			LOGI("Configuration set to default.");
+		}
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_DT_SET:
-			LOGE("DT_SET unimplemented");
-			break;
+	case MW_CMD_HRNG_GET:
+		replen = ByteSwapWord(c->rndLen);
+		if (replen > MW_CMD_MAX_BUFLEN) {
+			replen = 0;
+			reply.cmd = ByteSwapWord(MW_CMD_ERROR);
+		} else {
+			reply.datalen = c->rndLen;
+			rand_fill(reply.data, replen);
+		}
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + replen, 0);
+		break;
 
-		case MW_CMD_FLASH_WRITE:
-			if (flash_write(ntohl(c->flData.addr),
-						len - sizeof(uint32_t),
-						(char*)c->flData.data)) {
-				reply.cmd = ByteSwapWord(MW_CMD_ERROR);
-			}
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_BSSID_GET:
+		reply.datalen = ByteSwapWord(6);
+		esp_wifi_get_mac(c->data[0], reply.data);
+		LOGI("Got BSSID(%d) %02X:%02X:%02X:%02X:%02X:%02X",
+				c->data[0], reply.data[0], reply.data[1],
+				reply.data[2], reply.data[3],
+				reply.data[4], reply.data[5]);
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + 6, 0);
+		break;
 
-		case MW_CMD_FLASH_READ:
-			c->flRange.addr = ntohl(c->flRange.addr);
-			c->flRange.len = ntohs(c->flRange.len);
-			if (flash_read(c->flRange.addr, c->flRange.len,
-						(char*)reply.data)) {
-				reply.cmd = ByteSwapWord(MW_CMD_ERROR);
-				c->flRange.len = 0;
-			}
-			LsdSend((uint8_t*)&reply, c->flRange.len + MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_GAMERTAG_SET:
+		if (c->gamertag_set.slot >= MW_NUM_GAMERTAGS ||
+				len != sizeof(struct mw_gamertag_set_msg)) {
+			reply.cmd = ByteSwapWord(MW_CMD_ERROR);
+		} else {
+			// Copy gamertag and save to flash
+			memcpy(&cfg.gamertag[c->gamertag_set.slot],
+					&c->gamertag_set.gamertag,
+					sizeof(struct mw_gamertag));
+		}
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_FLASH_ERASE:
-			if (flash_erase(ntohs(c->flSect))) {
-				reply.cmd = ByteSwapWord(MW_CMD_ERROR);
-			}
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_GAMERTAG_GET:
+		if (c->data[0] >= MW_NUM_GAMERTAGS) {
+			replen = 0;
+			reply.cmd = ByteSwapWord(MW_CMD_ERROR);
+		} else {
+			replen = sizeof(struct mw_gamertag);
+			memcpy(&reply.gamertag_get, &cfg.gamertag[c->data[0]],
+					replen);
+		}
+		reply.datalen = ByteSwapWord(replen);
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + replen, 0);
+		break;
 
-		case MW_CMD_FLASH_ID:
-			reply.flash_id.device = htons(d.flash_dev);
-			reply.flash_id.manufacturer = d.flash_man;
-			reply.datalen = htons(3);
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + 3, 0);
-			break;
+	case MW_CMD_LOG:
+		puts((char*)c->data);
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_SYS_STAT:
-			MwSysStatFill(&reply);
-			LOGI("%02X %02X %02X %02X", reply.data[0], reply.data[1],
-					reply.data[2], reply.data[3]);
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + sizeof(MwMsgSysStat),
-				0);
-			break;
+	case MW_CMD_FACTORY_RESET:
+		MwSetDefaultCfg();
+		// Fallthrough
 
-		case MW_CMD_DEF_CFG_SET:
-			// Check lengt and magic value
-			if ((len != 4) || (c->dwData[0] !=
-						ByteSwapDWord(MW_FACT_RESET_MAGIC))) {
-				LOGE("Wrong DEF_CFG_SET command invocation!");
-				reply.cmd = ByteSwapWord(MW_CMD_ERROR);
-			} else if (esp_partition_erase_range(d.p_cfg, 0,
-						MW_CFG_SECT_LEN) != ESP_OK) {
-				LOGE("Config flash sector erase failed!");
-				reply.cmd = ByteSwapWord(MW_CMD_ERROR);
-			} else {
-				LOGI("Configuration set to default.");
-			}
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_NV_CFG_SAVE:
+		if (mw_nv_cfg_save() < 0) {
+			reply.cmd = ByteSwapWord(MW_CMD_ERROR);
+		}
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_HRNG_GET:
-			replen = ByteSwapWord(c->rndLen);
-			if (replen > MW_CMD_MAX_BUFLEN) {
-				replen = 0;
-				reply.cmd = ByteSwapWord(MW_CMD_ERROR);
-			} else {
-				reply.datalen = c->rndLen;
-				rand_fill(reply.data, replen);
-			}
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + replen, 0);
-			break;
+	case MW_CMD_SLEEP:
+		// No reply, wakeup continues from user_init()
+		deep_sleep();
+		LOGI("Entering deep sleep");
+		esp_deep_sleep(0);
+		// As it takes a little for the module to enter deep
+		// sleep, stay here for a while
+		vTaskDelayMs(60000);
+		// fallthrough
 
-		case MW_CMD_BSSID_GET:
-			reply.datalen = ByteSwapWord(6);
-			esp_wifi_get_mac(c->data[0], reply.data);
-			LOGI("Got BSSID(%d) %02X:%02X:%02X:%02X:%02X:%02X",
-					c->data[0], reply.data[0], reply.data[1],
-					reply.data[2], reply.data[3],
-					reply.data[4], reply.data[5]);
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + 6, 0);
-			break;
+	case MW_CMD_HTTP_URL_SET:
+		if (http_url_set((char*)c->data)) {
+			reply.cmd = htons(MW_CMD_ERROR);
+		}
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_GAMERTAG_SET:
-			if (c->gamertag_set.slot >= MW_NUM_GAMERTAGS ||
-					len != sizeof(struct mw_gamertag_set_msg)) {
-				reply.cmd = ByteSwapWord(MW_CMD_ERROR);
-			} else {
-				// Copy gamertag and save to flash
-				memcpy(&cfg.gamertag[c->gamertag_set.slot],
-						&c->gamertag_set.gamertag,
-						sizeof(struct mw_gamertag));
-			}
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_HTTP_METHOD_SET:
+		if (http_method_set(c->data[0])) {
+			reply.cmd = htons(MW_CMD_ERROR);
+		}
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_GAMERTAG_GET:
-			if (c->data[0] >= MW_NUM_GAMERTAGS) {
-				replen = 0;
-				reply.cmd = ByteSwapWord(MW_CMD_ERROR);
-			} else {
-				replen = sizeof(struct mw_gamertag);
-				memcpy(&reply.gamertag_get, &cfg.gamertag[c->data[0]],
-						replen);
-			}
-			reply.datalen = ByteSwapWord(replen);
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + replen, 0);
-			break;
+	case MW_CMD_HTTP_HDR_ADD:
+		if (http_header_add((char*)c->data)) {
+			reply.cmd = htons(MW_CMD_ERROR);
+		}
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_LOG:
-			puts((char*)c->data);
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_HTTP_HDR_DEL:
+		if (http_header_del((char*)c->data)) {
+			reply.cmd = htons(MW_CMD_ERROR);
+		}
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_FACTORY_RESET:
-			MwSetDefaultCfg();
-			// Fallthrough
+	case MW_CMD_HTTP_OPEN:
+		if (http_open(ntohl(c->dwData[0]))) {
+			reply.cmd = htons(MW_CMD_ERROR);
+		}
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_NV_CFG_SAVE:
-			if (mw_nv_cfg_save() < 0) {
-				reply.cmd = ByteSwapWord(MW_CMD_ERROR);
-			}
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_HTTP_FINISH:
+		replen = http_parse_finish(&reply);
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + replen, 0);
+		/// TODO: Thread this
+		http_recv();
+		break;
 
-		case MW_CMD_SLEEP:
-			// No reply, wakeup continues from user_init()
-			deep_sleep();
-			LOGI("Entering deep sleep");
-			esp_deep_sleep(0);
-			// As it takes a little for the module to enter deep
-			// sleep, stay here for a while
-			vTaskDelayMs(60000);
-			// fallthrough
+	case MW_CMD_HTTP_CLEANUP:
+		if (http_cleanup()) {
+			reply.cmd = htons(MW_CMD_ERROR);
+		}
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_HTTP_URL_SET:
-			if (http_url_set((char*)c->data)) {
-				reply.cmd = htons(MW_CMD_ERROR);
-			}
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_HTTP_CERT_QUERY:
+		reply.dwData[0] = htonl(http_cert_query());
+		if (0xFFFFFFFF == reply.dwData[0]) {
+			replen = 0;
+			reply.cmd = htons(MW_CMD_ERROR);
+		} else {
+			replen = 4;
+			reply.datalen = htons(4);
+		}
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + replen, 0);
+		break;
 
-		case MW_CMD_HTTP_METHOD_SET:
-			if (http_method_set(c->data[0])) {
-				reply.cmd = htons(MW_CMD_ERROR);
-			}
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_HTTP_CERT_SET:
+		if (http_cert_set(ntohl(c->dwData[0]),
+				ntohs(c->wData[2]))) {
+			reply.cmd = htons(MW_CMD_ERROR);
+		}
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_HTTP_HDR_ADD:
-			if (http_header_add((char*)c->data)) {
-				reply.cmd = htons(MW_CMD_ERROR);
-			}
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_SERVER_URL_GET:
+		replen = parse_server_url_get(&reply);
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + replen, 0);
+		break;
 
-		case MW_CMD_HTTP_HDR_DEL:
-			if (http_header_del((char*)c->data)) {
-				reply.cmd = htons(MW_CMD_ERROR);
-			}
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_SERVER_URL_SET:
+		parse_server_url_set((char*)c->data, &reply);
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_HTTP_OPEN:
-			if (http_open(ntohl(c->dwData[0]))) {
-				reply.cmd = htons(MW_CMD_ERROR);
-			}
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_WIFI_ADV_GET:
+		replen = parse_wifi_adv_get(&reply);
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + replen, 0);
+		break;
 
-		case MW_CMD_HTTP_FINISH:
-			replen = http_parse_finish(&reply);
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + replen, 0);
-			/// TODO: Thread this
-			http_recv();
-			break;
+	case MW_CMD_WIFI_ADV_SET:
+		parse_wifi_adv_set(&c->wifi_adv_cfg, &reply);
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_HTTP_CLEANUP:
-			if (http_cleanup()) {
-				reply.cmd = htons(MW_CMD_ERROR);
-			}
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_UPGRADE_LIST:
+		// TODO
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_HTTP_CERT_QUERY:
-			reply.dwData[0] = htonl(http_cert_query());
-			if (0xFFFFFFFF == reply.dwData[0]) {
-				reply.cmd = htons(MW_CMD_ERROR);
-			} else {
-				replen = 4;
-				reply.datalen = htons(4);
-			}
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + replen, 0);
-			break;
+	case MW_CMD_UPGRADE_PERFORM:
+		parse_upgrade((char*)c->data, &reply);
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_HTTP_CERT_SET:
-			if (http_cert_set(ntohl(c->dwData[0]),
-					ntohs(c->wData[2]))) {
-				reply.cmd = htons(MW_CMD_ERROR);
-			}
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_GAME_ENDPOINT_SET:
+		parse_game_endpoint_set((char*)c->data, &reply);
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_SERVER_URL_GET:
-			replen = parse_server_url_get(&reply);
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + replen, 0);
-			break;
+	case MW_CMD_GAME_KEYVAL_ADD:
+		parse_game_add_keyval((char*)c->data, &reply);
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
+		break;
 
-		case MW_CMD_SERVER_URL_SET:
-			parse_server_url_set((char*)c->data, &reply);
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
+	case MW_CMD_GAME_REQUEST:
+		replen = parse_game_request(&c->ga_request, &reply);
+		LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + replen, 0);
+		/// TODO: Thread this
+		http_recv();
+		break;
 
-		case MW_CMD_WIFI_ADV_GET:
-			replen = parse_wifi_adv_get(&reply);
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + replen, 0);
-			break;
-
-		case MW_CMD_WIFI_ADV_SET:
-			parse_wifi_adv_set(&c->wifi_adv_cfg, &reply);
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
-
-		case MW_CMD_UPGRADE_LIST:
-			// TODO
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
-
-		case MW_CMD_UPGRADE_PERFORM:
-			parse_upgrade((char*)c->data, &reply);
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
-
-		case MW_CMD_GAME_ENDPOINT_SET:
-			parse_game_endpoint_set((char*)c->data, &reply);
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
-
-		case MW_CMD_GAME_KEYVAL_ADD:
-			parse_game_add_keyval((char*)c->data, &reply);
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN, 0);
-			break;
-
-		case MW_CMD_GAME_REQUEST:
-			replen = parse_game_request(&c->ga_request, &reply);
-			LsdSend((uint8_t*)&reply, MW_CMD_HEADLEN + replen, 0);
-			/// TODO: Thread this
-			http_recv();
-			break;
-
-		default:
-			LOGE("UNKNOWN REQUEST!");
-			break;
+	default:
+		LOGE("UNKNOWN REQUEST!");
+		break;
 	}
 	return MW_OK;
 }
@@ -1785,15 +1820,15 @@ static int MwSend(int ch, const void *data, int len) {
 	int s = d.sock[idx];
 
 	switch (d.ss[idx]) {
-		case MW_SOCK_TCP_EST:
-			return lwip_send(s, data, len, 0);
+	case MW_SOCK_TCP_EST:
+		return lwip_send(s, data, len, 0);
 
-		case MW_SOCK_UDP_READY:
-			return MwUdpSend(idx, data, len);
-			break;
+	case MW_SOCK_UDP_READY:
+		return MwUdpSend(idx, data, len);
+		break;
 
-		default:
-			return -1;
+	default:
+		return -1;
 	}
 }
 
@@ -1802,104 +1837,101 @@ void MwFsmReady(MwFsmMsg *msg) {
 	// Pointer to the message buffer (from RX line).
 	MwMsgBuf *b = msg->d;
 	MwCmd *rep;
-	system_event_t *wifi = msg->d;
+	struct net_event *net = msg->d;
 
 	switch (msg->e) {
-		case MW_EV_WIFI:		///< WiFi events, excluding scan related.
-			LOGI("WIFI_EVENT %d (not parsed)", wifi->event_id);
-			break;
+	case MW_EV_NET:		///< WiFi events, excluding scan related.
+		LOGI("WIFI_EVENT %"PRId32" (not parsed)", net->event_id);
+		break;
 
-		case MW_EV_SER_RX:		///< Data reception from serial line.
-			LOGD("Serial recvd %d bytes.", b->len);
-			// If using channel 0, process command. Else forward message
-			// to the appropiate socket.
-			if (MW_CTRL_CH == b->ch) {
-				// Check command is allowed on READY state
-				if (MwCmdInList(b->cmd.cmd>>8, readyCmdMask)) {
-					MwFsmCmdProc((MwCmd*)b, b->len);
-				} else {
-					LOGE("Command %d not allowed on READY state",
-							b->cmd.cmd>>8);
-					// TODO: Throw error event?
+	case MW_EV_SER_RX:		///< Data reception from serial line.
+		LOGD("Serial recvd %"PRIu16" bytes.", b->len);
+		// If using channel 0, process command. Else forward message
+		// to the appropiate socket.
+		if (MW_CTRL_CH == b->ch) {
+			// Check command is allowed on READY state
+			if (MwCmdInList(b->cmd.cmd>>8, readyCmdMask)) {
+				MwFsmCmdProc((MwCmd*)b, b->len);
+			} else {
+				LOGE("Command %"PRIu16" not allowed on READY state",
+						b->cmd.cmd>>8);
+				// TODO: Throw error event?
+				rep = (MwCmd*)msg->d;
+				rep->datalen = 0;
+				rep->cmd = ByteSwapWord(MW_CMD_ERROR);
+				LsdSend((uint8_t*)rep, MW_CMD_HEADLEN, 0);
+			}
+		} else if (MW_HTTP_CH == b->ch) {
+			// Process channel using HTTP state machine
+			http_send((char*)b->data, b->len);
+		} else {
+			// Forward message if channel is enabled.
+			if (b->ch < LSD_MAX_CH && d.ss[b->ch - 1]) {
+				if (MwSend(b->ch, b->data, b->len) != b->len) {
+					LOGE("ch %"PRIu8" socket send error!", b->ch);
+					// TODO throw error event?
 					rep = (MwCmd*)msg->d;
 					rep->datalen = 0;
 					rep->cmd = ByteSwapWord(MW_CMD_ERROR);
 					LsdSend((uint8_t*)rep, MW_CMD_HEADLEN, 0);
 				}
-			} else if (MW_HTTP_CH == b->ch) {
-				// Process channel using HTTP state machine
-				http_send((char*)b->data, b->len);
 			} else {
-				// Forward message if channel is enabled.
-				if (b->ch < LSD_MAX_CH && d.ss[b->ch - 1]) {
-					if (MwSend(b->ch, b->data, b->len) != b->len) {
-						LOGE("ch %d socket send error!", b->ch);
-						// TODO throw error event?
-						rep = (MwCmd*)msg->d;
-						rep->datalen = 0;
-						rep->cmd = ByteSwapWord(MW_CMD_ERROR);
-						LsdSend((uint8_t*)rep, MW_CMD_HEADLEN, 0);
-					}
-				} else {
-					LOGE("Requested to forward data on wrong channel: %d",
-							b->ch);
-				}
+				LOGE("Requested to forward data on wrong channel: %"
+						PRIu8, b->ch);
 			}
-			break;
+		}
+		break;
 
-		default:
-			LOGI("UNKNOKWN EVENT %d", msg->e);
-			break;
+	default:
+		LOGI("UNKNOKWN EVENT %d", msg->e);
+		break;
 	}
 }
 
 // TODO: Refactor using the new event system
-static void ap_join_ev_handler(system_event_t *wifi)
+static void ap_join_ev_handler(struct net_event *net)
 {
-	LOGD("WiFi event: %d", wifi->event_id);
-	switch(wifi->event_id) {
-		case SYSTEM_EVENT_STA_START:
-			LOGI("setting mode %x", d.phy);
-			esp_wifi_set_protocol(ESP_IF_WIFI_STA, d.phy);
+	ip4_addr_t addr;
+	LOGD("Network event: %"PRId32, net->event_id);
+	switch(net->event_id) {
+	case WIFI_EVENT_STA_START:
+		LOGI("setting mode %x", d.phy);
+		esp_wifi_set_protocol(ESP_IF_WIFI_STA, d.phy);
+		esp_wifi_connect();
+		break;
+
+	case WIFI_EVENT_STA_STOP:
+		break;
+
+	case IP_EVENT_STA_GOT_IP:
+		addr.addr = net->got_ip.ip_info.ip.addr;
+		LOGI("got IP: %s, READY!", ip4addr_ntoa(&addr));
+		d.s.sys_stat = MW_ST_READY;
+		d.s.online = TRUE;
+		break;
+
+	case WIFI_EVENT_STA_CONNECTED:
+		LOGD("station:"MACSTR" join", MAC2STR(net->sta_connected.bssid));
+		break;
+
+	case WIFI_EVENT_STA_DISCONNECTED:
+		d.n_reassoc++;
+		LOGE("Disconnect %d, reason : %d", d.n_reassoc,
+				net->sta_disconnected.reason);
+		if (d.n_reassoc < MW_REASSOC_MAX) {
 			esp_wifi_connect();
-			break;
-
-		case SYSTEM_EVENT_STA_STOP:
-			break;
-
-		case SYSTEM_EVENT_STA_GOT_IP:
-			LOGI("got IP: %s, READY!", ip4addr_ntoa(
-					&wifi->event_info.got_ip.ip_info.ip));
-			d.s.sys_stat = MW_ST_READY;
-			d.s.online = TRUE;
-			break;
-
-		case SYSTEM_EVENT_STA_CONNECTED:
-			LOGD("station:"MACSTR" join",
-					MAC2STR(wifi->event_info.connected.bssid));
-			break;
-
-		case SYSTEM_EVENT_STA_DISCONNECTED:
-			d.n_reassoc++;
-			LOGE("Disconnect %d, reason : %d", d.n_reassoc,
-					wifi->event_info.disconnected.reason);
-			if (d.n_reassoc < MW_REASSOC_MAX) {
-				if (wifi->event_info.disconnected.reason ==
-						WIFI_REASON_BASIC_RATE_NOT_SUPPORT) {
-				}
-				esp_wifi_connect();
-			} else {
-				LOGE("Too many assoc attempts, dessisting");
-				esp_wifi_disconnect();
-				d.s.sys_stat = MW_ST_IDLE;
-			}
-			break;
-
-		default:
-			LOGE("unhandled event %d, connect failed, IDLE!",
-					wifi->event_id);
+		} else {
+			LOGE("Too many assoc attempts, dessisting");
 			esp_wifi_disconnect();
 			d.s.sys_stat = MW_ST_IDLE;
+		}
+		break;
+
+	default:
+		LOGE("unhandled event %"PRId32", connect failed, IDLE!",
+				net->event_id);
+		esp_wifi_disconnect();
+		d.s.sys_stat = MW_ST_IDLE;
 	}
 }
 
@@ -1917,7 +1949,7 @@ static void MwFsm(MwFsmMsg *msg) {
 			break;
 
 		case MW_ST_AP_JOIN:
-			if (MW_EV_WIFI == msg->e) {
+			if (MW_EV_NET == msg->e) {
 				ap_join_ev_handler(msg->d);
 			} else if (MW_EV_SER_RX == msg->e) {
 				// The only rx events supported during AP_JOIN are AP_LEAVE,
@@ -1990,7 +2022,7 @@ static void MwFsm(MwFsmMsg *msg) {
 			break;
 	}
 	// Free WiFi event
-	if (MW_EV_WIFI == msg->e) {
+	if (MW_EV_NET == msg->e) {
 		free(msg->d);
 	}
 }

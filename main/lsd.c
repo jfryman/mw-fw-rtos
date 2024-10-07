@@ -15,7 +15,7 @@
 #include "util.h"
 
 #include <driver/uart.h>
-#include <semphr.h>
+#include <freertos/semphr.h>
 
 /// Number of buffer frames available
 #define LSD_BUF_FRAMES			2

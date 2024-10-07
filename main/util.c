@@ -61,8 +61,9 @@ void bin_to_str(const uint8_t *bin, unsigned bin_len, char *str)
 
 int ipv4_to_str(uint32_t ipv4, char str[14])
 {
-	return sprintf(str, "%d.%d.%d.%d", 0xFF & ipv4, 0xFF & (ipv4>>8),
-		    0xFF & (ipv4>>16), ipv4>>24);
+	return sprintf(str, "%"PRIu8".%"PRIu8".%"PRIu8".%"PRIu8,
+			(uint8_t)(0xFF & ipv4), (uint8_t)(0xFF & (ipv4>>8)),
+			(uint8_t)(0xFF & (ipv4>>16)), (uint8_t)(ipv4>>24));
 }
 
 /// Similar to strcpy, but returns a pointer to the last character of the

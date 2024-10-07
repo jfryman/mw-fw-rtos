@@ -2,5 +2,8 @@
 # in this exact order for cmake to work correctly
 cmake_minimum_required(VERSION 3.5)
 
+# Remove to disable logs
+add_definitions(-D_DEBUG_MSGS)
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(project_template)
