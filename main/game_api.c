@@ -1,7 +1,6 @@
 #include <string.h>
-#include <esp_sha.h>
+#include <mbedtls/sha1.h>
 #include "game_api.h"
-#include "linux_list.h"
 #include "util.h"
 
 /// \todo Module is slow because of te continuous realloc and copy. Optimize.
@@ -215,16 +214,16 @@ static int url_alloc_build(char **url, uint8_t num_paths, uint8_t num_kv_pairs,
 
 static void signature_append(char **url, int url_len)
 {
-	esp_sha1_t sha1_handle;
+	mbedtls_sha1_context sha1_handle;
 	uint8_t sha1[SHA1_BYTES] = {0};
 	char sha1_str[SHA1_DIGITS + 1] = {0};
 	char *aux = NULL;
 	int aux_len;
 
-	esp_sha1_init(&sha1_handle);
-	esp_sha1_update(&sha1_handle, *url, url_len);
-	esp_sha1_update(&sha1_handle, ga.priv_key, ga.priv_key_len);
-	esp_sha1_finish(&sha1_handle, sha1);
+	mbedtls_sha1_init(&sha1_handle);
+	mbedtls_sha1_update(&sha1_handle, (unsigned char*)*url, url_len);
+	mbedtls_sha1_update(&sha1_handle, (unsigned char*)ga.priv_key, ga.priv_key_len);
+	mbedtls_sha1_finish(&sha1_handle, sha1);
 
 	sha1_to_str(sha1, sha1_str);
 	// FIXME assumes URL has at least 1 parameter. Separator should be
