@@ -41,12 +41,16 @@
 #include <freertos/queue.h>
 
 /// LSD UART baud rate
-//#define LSD_UART_BR		(475625LU/2)
-//#define LSD_UART_BR		(477500/2)
 #define LSD_UART_BR		1500000
 //#define LSD_UART_BR		500000
 //#define LSD_UART_BR		750000
 //#define LSD_UART_BR		115200
+
+#define UART_DEV UART_NUM_0
+#define UART_TX_PIN 21
+#define UART_RX_PIN 20
+#define UART_RTS_PIN 0
+#define UART_CTS_PIN 9
 
 /** \addtogroup lsd ReturnCodes OK/Error codes returned by several functions.
  *  \{ */

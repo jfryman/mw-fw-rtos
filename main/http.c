@@ -100,12 +100,6 @@ static inline int http_open_int(esp_http_client_handle_t client, int write_len)
 	return esp_http_client_open(client, write_len);
 }
 
-static inline int http_body_write(esp_http_client_handle_t client,
-		const char *data, int len)
-{
-	return esp_http_client_write(client, data, len);
-}
-
 static inline int http_finish_int(esp_http_client_handle_t client, int32_t *data_len)
 {
 	int len;

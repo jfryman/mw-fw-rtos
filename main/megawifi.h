@@ -54,7 +54,7 @@
 #define MW_FSM_STACK_LEN	8192
 
 /// Stack size (in elements) for SOCK task
-#define MW_SOCK_STACK_LEN	1024
+#define MW_SOCK_STACK_LEN	2048
 
 /// Control channel used for command interpreter
 #define MW_CTRL_CH			0

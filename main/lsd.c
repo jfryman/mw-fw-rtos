@@ -76,9 +76,10 @@ void LsdInit(QueueHandle_t q) {
 	memset(&d, 0, sizeof(LsdData));
 	d.rxs = LSD_ST_STX_WAIT;
 	// Configure UART
-	ESP_ERROR_CHECK(uart_param_config(UART_NUM_0, &lsd_uart));
-//	ESP_ERROR_CHECK(uart_set_pin(UART_NUM_0, 1, 3, 15, 13));
-	ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0, 1024, 0, 0, NULL, 0));
+	ESP_ERROR_CHECK(uart_param_config(UART_DEV, &lsd_uart));
+	ESP_ERROR_CHECK(uart_set_pin(UART_DEV, UART_TX_PIN, UART_RX_PIN,
+				UART_RTS_PIN, UART_CTS_PIN));
+	ESP_ERROR_CHECK(uart_driver_install(UART_DEV, 1024, 0, 0, NULL, 0));
 	// Create semaphore used to handle receive buffers
 	d.sem = xSemaphoreCreateCounting(LSD_BUF_FRAMES, LSD_BUF_FRAMES);
 	// Create receive task

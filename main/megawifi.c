@@ -961,7 +961,7 @@ int MwInit(void) {
 		PANIC("config partition initialization failed");
 	}
 	if (sizeof(MwNvCfg) > d.p_cfg->size) {
-		PANIC("config length too big (%d)", sizeof(MwNvCfg));
+		PANIC("config length too big (%zd)", sizeof(MwNvCfg));
 	}
 	print_flash_id();
 	// Load configuration from flash
@@ -2114,7 +2114,7 @@ void MwFsmSockTsk(void *pvParameters) {
 	fd_set readset;
 	int i, ch, retval;
 	int max;
-	ssize_t recvd;
+	int recvd;
 	struct timeval tv = {
 		.tv_sec = 1,
 		.tv_usec = 0
