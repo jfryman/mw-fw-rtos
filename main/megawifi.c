@@ -309,9 +309,14 @@ struct net_event {
 	};
 };
 
-#define NET_EVENT_BASE_LEN (sizeof(esp_event_base_t) + sizeof(int32_t))
 
-//static esp_err_t event_handler(void *ctx, system_event_t *event)
+static void channel_change_log(const wifi_event_home_channel_change_t *cch)
+{
+	LOGI("channel change, old: %"PRIu8", new: %"PRIu8,
+			cch->old_chan, cch->new_chan);
+}
+
+#define NET_EVENT_BASE_LEN (sizeof(esp_event_base_t) + sizeof(int32_t))
 static void event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data)
 {
@@ -324,26 +329,42 @@ static void event_handler(void* arg, esp_event_base_t event_base,
 		return;
 	}
 
-	switch (event_id) {
-	case WIFI_EVENT_STA_START:
-	case WIFI_EVENT_STA_STOP:
-		data_len = 0;
-		break;
+	if (WIFI_EVENT == event_base) {
+		switch (event_id) {
+		case WIFI_EVENT_STA_START:
+		case WIFI_EVENT_STA_STOP:
+			data_len = 0;
+			break;
 
-	case IP_EVENT_STA_GOT_IP:
-		data_len = sizeof(ip_event_got_ip_t);
-		break;
+		case WIFI_EVENT_STA_CONNECTED:
+			data_len = sizeof(wifi_event_sta_connected_t);
+			break;
 
-	case WIFI_EVENT_STA_CONNECTED:
-		data_len = sizeof(wifi_event_sta_connected_t);
-		break;
+		case WIFI_EVENT_STA_DISCONNECTED:
+			data_len = sizeof(wifi_event_sta_connected_t);
+			break;
 
-	case WIFI_EVENT_STA_DISCONNECTED:
-		data_len = sizeof(wifi_event_sta_connected_t);
-		break;
+		case WIFI_EVENT_HOME_CHANNEL_CHANGE:
+			channel_change_log(event_data);
+			return;
 
-	default:
-		LOGE("unsupported event: %"PRId32, event_id);
+		default:
+			LOGE("unsupported wifi event: %"PRId32, event_id);
+			return;
+
+		}
+	} else if (IP_EVENT == event_base) {
+		switch (event_id) {
+		case IP_EVENT_STA_GOT_IP:
+			data_len = sizeof(ip_event_got_ip_t);
+			break;
+
+		default:
+			LOGE("unsuported IP event %"PRId32, event_id);
+			return;
+		}
+	} else {
+		LOGE("unsupported event_base %p", event_base);
 		return;
 	}
 
@@ -455,6 +476,7 @@ static esp_err_t wifi_init(void)
 	esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
 				&event_handler, d.q);
 
+	esp_netif_create_default_wifi_sta();
 
 	esp_wifi_set_storage(WIFI_STORAGE_RAM);
 	esp_wifi_set_mode(WIFI_MODE_STA);
