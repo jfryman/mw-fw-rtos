@@ -6,4 +6,4 @@ cmake_minimum_required(VERSION 3.5)
 add_definitions(-D_DEBUG_MSGS)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(project_template)
+project(mw-fw-rtos)

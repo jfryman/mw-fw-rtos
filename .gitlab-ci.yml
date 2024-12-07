@@ -1,3 +1,7 @@
+variables:
+  TARGET: "esp32c3"
+  ARTIFACT: "mw_fw_rtos_$TARGET-$CI_COMMIT_REF_SLUG.tar.xz"
+
 stages:
   - build
   - upload
@@ -6,16 +10,18 @@ build:
   stage: build
 
   image:
-    name: $CI_REGISTRY/doragasu/esp-dockerfiles/esp8266_rtos_sdk:release_v3.4
+    name: $CI_REGISTRY/doragasu/esp-dockerfiles/esp-idf:v5.3.1
     entrypoint: [""]
 
   script:
-    - make -j$(nproc)
-    - cd build && tar -cJf ../mw_fw_rtos-$CI_COMMIT_REF_SLUG.tar.xz {bootloader/bootloader.bin,mw-fw-rtos.bin,ota_data_initial.bin,partitions.bin}
+    - source /home/esp/.idf_env
+    - idf.py set-target $TARGET
+    - idf.py build
+    - cd build && tar -cJf ../$ARTIFACT {bootloader/bootloader.bin,mw-fw-rtos.bin,ota_data_initial.bin,partition_table/partition-table.bin}
 
   artifacts:
     paths:
-      - mw_fw_rtos-$CI_COMMIT_REF_SLUG.tar.xz
+      - $ARTIFACT
 
 upload:
   stage: upload
@@ -25,4 +31,4 @@ upload:
   image: curlimages/curl:latest
 
   script:
-    - 'curl --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file mw_fw_rtos-$CI_COMMIT_REF_SLUG.tar.xz "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/mw_firmware-$CI_COMMIT_TAG/$CI_COMMIT_TAG/mw_fw_rtos-$CI_COMMIT_TAG.tar.xz"'
+    - 'curl --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file $ARTIFACT "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/$TARGET/mw_firmware-$CI_COMMIT_TAG/$CI_COMMIT_TAG/$ARTIFACT"'
