@@ -136,7 +136,6 @@ struct mw_gamertag_set_msg {
 
 /// Advanced WiFi configuration. Handle with care!
 struct mw_wifi_adv_cfg {
-//	uint8_t qos_enable;                 ///< WiFi QOS feature enable flag
 	uint8_t ampdu_rx_enable;            ///< WiFi AMPDU RX feature enable flag
 	uint8_t ampdu_tx_enable;            ///< WiFi AMPDU TX feature enable flag (new)
 	uint8_t amsdu_tx_enable;            ///< WiFi AMSDU TX feature enable flag (new)
@@ -145,16 +144,6 @@ struct mw_wifi_adv_cfg {
 	uint8_t static_tx_buf_num;          ///< WiFi static TX buffer number (new)
 	uint8_t dynamic_tx_buf_num;         ///< WiFi dynamic TX buffer number (new)
 	uint8_t rx_ba_win;                  ///< WiFi Block Ack RX window size
-//	uint8_t rx_ampdu_buf_num;           ///< WiFi AMPDU RX buffer number
-//	uint32_t rx_ampdu_buf_len;          ///< WiFi AMPDU RX buffer length
-//	uint32_t rx_max_single_pkt_len;     ///< WiFi RX max single packet size
-//	uint32_t rx_buf_len;                ///< WiFi RX buffer size
-//	uint8_t amsdu_rx_enable;            ///< WiFi AMSDU RX feature enable flag
-//	uint8_t rx_buf_num;                 ///< WiFi RX buffer number
-//	uint8_t rx_pkt_num;                 ///< WiFi RX packet number
-//	uint8_t left_continuous_rx_buf_num; ///< WiFi Rx left continuous rx buffer number
-//	uint8_t tx_buf_num;                 ///< WiFi TX buffer number
-//	uint8_t reserved[3];                ///< Unused, set to 0
 };
 
 /// Flash chip identifiers

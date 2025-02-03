@@ -1,3 +1,4 @@
+#include <spi_flash_mmap.h>
 #include <esp_partition.h>
 #include <string.h>
 #include "globals.h"
@@ -28,6 +29,10 @@ struct http_data {
 	uint32_t hash_tmp;
 	/// Partition with the certificate
 	const esp_partition_t *p;
+	/// Handle to the partition memory map
+	spi_flash_mmap_handle_t h_map;
+	/// Pointer to the memory mapped partition
+	const void *p_map;
 	/// Buffer used to send/recv HTTP data
 	char *buf;
 };
@@ -38,7 +43,7 @@ static struct http_data d;
 #define CERT_LEN_OFF	sizeof(uint32_t)
 #define CERT_OFF	(2 * sizeof(uint32_t))
 
-#define CERT_P_PTR(type, off)	((type*)SPI_FLASH_ADDR((d.p->address + (off))))
+#define CERT_P_PTR(type, off)	((type*)(d.p_map + (off)))
 
 int http_module_init(char *data_buf)
 {
@@ -46,9 +51,16 @@ int http_module_init(char *data_buf)
 
 	d.p = esp_partition_find_first(MW_DATA_PART_TYPE, MW_CERT_PART_SUBTYPE,
 			MW_CERT_PART_LABEL);
-
 	if (!d.p) {
+		LOGE("unable to find cert partition");
 		return 1;
+	}
+
+	const esp_err_t err = esp_partition_mmap(d.p, 0, d.p->size,
+			SPI_FLASH_MMAP_DATA, &d.p_map, &d.h_map);
+	if (err) {
+		LOGE("unable to map cert partition: %s", esp_err_to_name(err));
+		return 2;
 	}
 
 	d.buf = data_buf;
@@ -128,7 +140,6 @@ esp_http_client_handle_t http_init(const char *url,
 	// No fancy esp_partition_mmap support, so access directly to data
 	uint32_t cert_len = *CERT_P_PTR(uint32_t, CERT_LEN_OFF);
 	const char *cert = CERT_P_PTR(const char, CERT_OFF);
-
 
 	if (!cert_len || cert_len > MW_CERT_MAXLEN || !cert[0] ||
 			0xFF == (unsigned char)cert[0]) {

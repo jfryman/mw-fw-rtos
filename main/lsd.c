@@ -83,7 +83,7 @@ void LsdInit(QueueHandle_t q) {
 	// Create semaphore used to handle receive buffers
 	d.sem = xSemaphoreCreateCounting(LSD_BUF_FRAMES, LSD_BUF_FRAMES);
 	// Create receive task
-	xTaskCreate(LsdRecvTsk, "LSDR", 1024, q, LSD_RECV_PRIO, NULL);
+	xTaskCreate(LsdRecvTsk, "LSDR", 2048, q, LSD_RECV_PRIO, NULL);
 }
 
 /************************************************************************//**
