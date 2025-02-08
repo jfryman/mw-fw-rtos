@@ -70,7 +70,8 @@ void LsdInit(QueueHandle_t q) {
 		.parity = UART_PARITY_DISABLE,
 		.stop_bits = UART_STOP_BITS_1,
 		.flow_ctrl = UART_HW_FLOWCTRL_CTS_RTS,
-		.rx_flow_ctrl_thresh = 122
+		.rx_flow_ctrl_thresh = 122,
+		.source_clk = UART_SCLK_XTAL
 	};
 	// Set variables to default values
 	memset(&d, 0, sizeof(LsdData));
