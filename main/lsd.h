@@ -78,7 +78,7 @@
 #define LSD_RECV_PRIO		2
 
 /// Maximum data payload length
-#define LSD_MAX_LEN		 CONFIG_TCP_MSS
+#define LSD_MAX_LEN		 1460
 
 /************************************************************************//**
  * Module initialization. Call this function before any other one in this
