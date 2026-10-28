@@ -1,5 +1,13 @@
 # mw-fw-rtos
 
+> **This is the MegaWiFi Rev.C fork** of [doragasu/mw-fw-rtos](https://gitlab.com/doragasu/mw-fw-rtos).
+> The `rev-c` branch runs the cart link at **1.25 Mbaud** (`LSD_UART_BR` in `main/lsd.h`), because
+> Rev.C carts ([jfryman/mw-cart](https://github.com/jfryman/mw-cart)) use a TI TL16C550D clocked at
+> 20 MHz instead of the NXP SC16C550B at 24 MHz. That is the only change. Use this firmware **only**
+> on Rev.C carts; stock carts need upstream's 1.5 Mbaud build. Pre-built ESP32-C3 images are on the
+> [releases page](https://github.com/jfryman/mw-fw-rtos/releases). Flash over the cart's USB-C port:
+> `esptool.py --chip esp32c3 -p <port> write_flash 0x0 mw-fw-rtos-merged.bin`.
+
 Firmare for the ESP8266 WiFi module installed in MegaWiFi cartridges. This firmware talks directly to the MegaWiFi API (mw-api) running on the Genesis/MegaDrive console, allowing it to connect to WiFi access points, and to send and receive data through The Internet using standard TCP and UDP protocols. There are some additional goodies provided by the firmware, like flash read/write functions and SNTP time synchronization.
 
 # Obtaining pre-built firmware files
