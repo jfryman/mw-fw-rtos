@@ -41,7 +41,7 @@
 #include <freertos/queue.h>
 
 /// LSD UART baud rate
-#define LSD_UART_BR		1500000
+#define LSD_UART_BR		1250000	// Rev.C: TL16C550D @ 20 MHz
 //#define LSD_UART_BR		500000
 //#define LSD_UART_BR		750000
 //#define LSD_UART_BR		115200
